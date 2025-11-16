@@ -1,0 +1,2 @@
+crea una pagina web che funziona tipo memory share:si sceglie una "room" e da quel momento chiunque ha quel link puo vedere e scrivere dati sulla pagina. devi rispettare eventuali formattazioni (tipo se 
+scrivo codice html e java deve rimanere la formattazioni).scrivilo in python con flask e socketio. ceea unfile per ogni room. quando parte devo poter scegliere su quale porta lanciare il server. ecco il codice:
