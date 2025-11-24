@@ -37,6 +37,11 @@ def get_room_file(room_name):
     return get_room_dir(room_name) / "chat.txt"
 
 
+def get_room_chat_file(room_name):
+    """Get the chat messages file path for a room"""
+    return get_room_dir(room_name) / "chat_messages.json"
+
+
 def load_room_content(room_name):
     """Load content from room chat file"""
     room_file = get_room_file(room_name)
@@ -51,6 +56,33 @@ def save_room_content(room_name, content):
     room_file = get_room_file(room_name)
     with open(room_file, 'w', encoding='utf-8') as f:
         f.write(content)
+
+
+def load_chat_messages(room_name):
+    """Load chat messages from room"""
+    import json
+    chat_file = get_room_chat_file(room_name)
+    if chat_file.exists():
+        try:
+            with open(chat_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+
+def save_chat_message(room_name, nickname, message, timestamp):
+    """Save a chat message to room"""
+    import json
+    messages = load_chat_messages(room_name)
+    messages.append({
+        'nickname': nickname,
+        'message': message,
+        'timestamp': timestamp
+    })
+    chat_file = get_room_chat_file(room_name)
+    with open(chat_file, 'w', encoding='utf-8') as f:
+        json.dump(messages, f, ensure_ascii=False, indent=2)
 
 
 def get_room_files(room_name):
@@ -208,6 +240,33 @@ def on_content_update(data):
 def on_disconnect():
     """Handle user disconnection"""
     pass
+
+
+@socketio.on('chat_message')
+def on_chat_message(data):
+    """Handle chat message from user"""
+    room_name = data['room']
+    nickname = data['nickname']
+    message = data['message']
+    timestamp = data['timestamp']
+    
+    # Save message to file
+    save_chat_message(room_name, nickname, message, timestamp)
+    
+    # Broadcast to all users in the room except sender
+    emit('chat_message', {
+        'nickname': nickname,
+        'message': message,
+        'timestamp': timestamp
+    }, room=room_name, skip_sid=request.sid)
+
+
+@socketio.on('request_chat_messages')
+def on_request_chat_messages(data):
+    """Send chat messages to requesting user"""
+    room_name = data['room']
+    messages = load_chat_messages(room_name)
+    emit('load_chat_messages', {'messages': messages})
 
 
 if __name__ == '__main__':
