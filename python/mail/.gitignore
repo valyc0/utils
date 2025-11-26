@@ -1,0 +1,16 @@
+# File di configurazione con credenziali
+config.json
+
+# Log files
+mail.log
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# OS files
+.DS_Store
+Thumbs.db

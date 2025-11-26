@@ -1,0 +1,6 @@
+# Dipendenze Python per mail.py
+# Tutte le librerie utilizzate sono parte della standard library di Python 3
+# Non sono necessarie installazioni aggiuntive tramite pip
+
+# Se necessario, puoi comunque specificare la versione minima di Python richiesta:
+# python>=3.6
