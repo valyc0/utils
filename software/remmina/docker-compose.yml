@@ -1,0 +1,21 @@
+services:
+  remmina:
+    image: lscr.io/linuxserver/remmina
+    container_name: remmina
+    restart: always
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+    ports:
+      - "3000:3000"
+
+  nginx-remmina:
+    image: nginx
+    container_name: nginx-remmina
+    restart: always
+    network_mode: host
+    volumes:
+      - ./conf:/etc/nginx/conf.d
+      - ./ssl:/etc/nginx/ssl
+      - ./conf/.htpasswd:/etc/nginx/.htpasswd
