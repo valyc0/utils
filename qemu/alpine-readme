@@ -1,0 +1,88 @@
+# SCARICARE ISO ALPINE LINUX:
+wget https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-3.23.0-x86_64.iso
+
+
+# CREARE DISCO QEMU: 
+qemu-img create -f qcow2 ./disco.qcow2 100G
+
+# CREARE DISCO QEMU CON PREALLOCAZIONE METADATA (PIU' VELOCE):
+qemu-img create -f qcow2 -o preallocation=metadata /home/valerio/lavoro/qemu/disco.qcow2 100G
+
+
+# AVVIARE QEMU CON ISO ALPINE LINUX PER INSTALLAZIONE:
+qemu-system-x86_64 \
+  -m 8046 \
+  -smp 2 \
+  -cpu host \
+  -hda disco.qcow2 \
+  -cdrom alpine-virt-3.23.0-x86_64.iso \
+  -boot d \
+  -net nic \
+  -net user,hostfwd=tcp::2222-:22 \
+  -enable-kvm \
+  -nographic
+
+# seguire installazione con setup-alpine
+
+# AVVIARE QEMU DOPO INSTALLAZIONE:
+qemu-system-x86_64 \
+  -m 8046 \
+  -smp 2 \
+  -cpu host \
+  -hda disco.qcow2 \
+  -boot d \
+  -net nic \
+  -net user,hostfwd=tcp::2222-:22 \
+  -enable-kvm \
+  -nographic
+
+#DALLA MACCHINA HOST, PRIMA CONNESSIONE SSH AL SISTEMA ALPINE LINUX IN QEMU:
+ssh root@localhost -p 2222
+# RIMUOVERE VECCHIA CHIAVE SSH SE CAMBIA INDIRIZZO IP O PORTA:
+ssh-keygen -f "/home/valerio/.ssh/known_hosts" -R "[localhost]:2222"
+
+
+
+
+# PROSEGUIRE CON LA CONFIGURAZIONE DEL SISTEMA ALPINE LINUX IN QEMU:
+
+# CONFIGURAZIONE ALPINE LINUX DOPO INSTALLAZIONE PER DOCKER:
+cat << 'EOF' > /etc/apk/repositories
+http://dl-cdn.alpinelinux.org/alpine/v3.23/main
+http://dl-cdn.alpinelinux.org/alpine/v3.23/community
+EOF
+
+
+apk update
+
+
+apk add docker
+
+service docker start
+rc-update add docker boot
+
+
+
+# CONFIGURAZIONE ALPINE LINUX DOPO INSTALLAZIONE PER ACCESSO SSH CON PORT FORWARDING:
+sed -i \
+  -e 's/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/' \
+  -e 's/^#\?GatewayPorts.*/GatewayPorts yes/' \
+  -e 's/^#\?PermitTunnel.*/PermitTunnel yes/' \
+  /etc/ssh/sshd_config && rc-service sshd restart
+
+
+# CONNETTERSI VIA SSH AL SISTEMA ALPINE LINUX IN QEMU:
+ssh -L 8080:localhost:8080 root@localhost -p 2222
+
+docker run -d --name test-busybox \
+  -p 8080:8080 \
+  busybox sh -c "httpd -f -p 8080"
+  
+  
+  
+curl http://localhost:8080
+
+apk update
+apk add git curl
+git --version
+curl --version
