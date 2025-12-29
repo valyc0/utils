@@ -6,7 +6,7 @@ wget https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-3.2
 qemu-img create -f qcow2 ./disco.qcow2 100G
 
 # CREARE DISCO QEMU CON PREALLOCAZIONE METADATA (PIU' VELOCE):
-qemu-img create -f qcow2 -o preallocation=metadata /home/valerio/lavoro/qemu/disco.qcow2 100G
+qemu-img create -f qcow2 -o preallocation=metadata ./disco.qcow2 100G
 
 
 # AVVIARE QEMU CON ISO ALPINE LINUX PER INSTALLAZIONE:
