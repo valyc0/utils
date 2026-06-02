@@ -689,7 +689,10 @@
     </div>
 
     <script>
-        const socket = io();
+        const SUB_PATH = "{{ sub_path }}";
+        const socket = io({
+            path: (SUB_PATH || '') + '/socket.io'
+        });
         const editor = document.getElementById('editor');
         const statusEl = document.getElementById('status');
         const charCountEl = document.getElementById('charCount');
@@ -805,7 +808,7 @@
 
         socket.on('room_deleted', (data) => {
             alert('Questa stanza è stata eliminata!');
-            window.location.href = '/';
+            window.location.href = SUB_PATH || '/';
         });
 
         socket.on('chat_message', (data) => {
@@ -966,7 +969,7 @@
                             reject(new Error('Upload aborted'));
                         });
 
-                        xhr.open('POST', `/room/${roomName}/upload`);
+                        xhr.open('POST', `${SUB_PATH}/room/${roomName}/upload`);
                         xhr.send(formData);
                     });
                 } catch (error) {
@@ -983,14 +986,14 @@
         }
 
         function downloadFile(filename) {
-            window.location.href = `/room/${roomName}/download/${encodeURIComponent(filename)}`;
+            window.location.href = `${SUB_PATH}/room/${roomName}/download/${encodeURIComponent(filename)}`;
         }
 
         async function deleteFile(filename) {
             if (!confirm(`Sei sicuro di voler eliminare "${filename}"?`)) return;
 
             try {
-                const response = await fetch(`/room/${roomName}/delete/${encodeURIComponent(filename)}`, {
+                const response = await fetch(`${SUB_PATH}/room/${roomName}/delete/${encodeURIComponent(filename)}`, {
                     method: 'DELETE'
                 });
 
@@ -1013,7 +1016,7 @@
         }
 
         function downloadChat() {
-            window.location.href = `/room/${roomName}/download-chat`;
+            window.location.href = `${SUB_PATH}/room/${roomName}/download-chat`;
         }
 
         function clearEditor() {
@@ -1060,7 +1063,7 @@
             if (!confirm('Conferma ancora una volta: eliminare definitivamente la stanza "' + roomName + '"?')) return;
 
             try {
-                const response = await fetch(`/room/${roomName}/delete-room`, {
+                const response = await fetch(`${SUB_PATH}/room/${roomName}/delete-room`, {
                     method: 'DELETE'
                 });
 
@@ -1068,7 +1071,7 @@
 
                 if (result.success) {
                     alert('Stanza eliminata con successo');
-                    window.location.href = '/';
+                    window.location.href = SUB_PATH || '/';
                 } else {
                     showNotification(`Errore: ${result.error}`, true);
                 }
@@ -1078,7 +1081,7 @@
         }
 
         function goHome() {
-            window.location.href = '/';
+            window.location.href = SUB_PATH || '/';
         }
 
         function switchMode(mode) {

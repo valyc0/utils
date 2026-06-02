@@ -122,6 +122,7 @@
     </div>
     
     <script>
+        const SUB_PATH = "{{ sub_path }}";
         const roomInput = document.getElementById('roomName');
         
         // Generate random room code
@@ -154,7 +155,7 @@
             }
             
             // Redirect to room page
-            window.location.href = `/room/${encodeURIComponent(roomName)}`;
+            window.location.href = `${SUB_PATH}/room/${encodeURIComponent(roomName)}`;
         }
     </script>
 </body>

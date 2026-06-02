@@ -14,6 +14,10 @@ from pathlib import Path
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'memory-share-secret-key-2023'
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024 * 1024  # 20GB max file size
+
+# Sub-path for reverse proxy (e.g. /memory)
+# Set SUB_PATH env var when running behind nginx with a path prefix
+SUB_PATH = os.environ.get('SUB_PATH', '').rstrip('/')
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=20 * 1024 * 1024 * 1024)
 
 # Directory to store room data
@@ -103,13 +107,13 @@ def get_room_files(room_name):
 @app.route('/')
 def index():
     """Home page - choose or create a room"""
-    return render_template('index.html')
+    return render_template('index.html', sub_path=SUB_PATH)
 
 
 @app.route('/room/<room_name>')
 def room(room_name):
     """Room page - collaborative editing"""
-    return render_template('room.html', room_name=room_name)
+    return render_template('room.html', room_name=room_name, sub_path=SUB_PATH)
 
 
 @app.route('/room/<room_name>/upload', methods=['POST'])

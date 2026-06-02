@@ -4,15 +4,17 @@
 # Usage: ./start.sh [porta]
 
 PORT=${1:-5000}
+SUB_PATH=${2:-}
 VENV_DIR="venv"
 
 echo "==================================="
 echo "  Memory Share - Avvio Server"
 echo "==================================="
 echo ""
-echo "ℹ️  Per avviare su una porta diversa:"
-echo "   ./start.sh 8080"
-echo "   ./start.sh 3000"
+echo "ℹ️  Esempi:"
+echo "   ./start.sh                    # porta 5000, nessun sub-path"
+echo "   ./start.sh 8080               # porta 8080"
+echo "   ./start.sh 5000 /memory       # porta 5000, sub-path /memory"
 echo ""
 
 # Verifica se Python è installato
@@ -45,4 +47,4 @@ echo ""
 echo "Premi Ctrl+C per fermare il server"
 echo ""
 
-python3 app.py $PORT
+SUB_PATH=$SUB_PATH python3 app.py $PORT
