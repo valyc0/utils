@@ -76,6 +76,22 @@
             background: rgba(255, 255, 255, 0.3);
         }
 
+        .btn-curl-upload {
+            background: #fbbf24;
+            color: #1e1e1e;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.3s;
+        }
+
+        .btn-curl-upload:hover {
+            background: #f59e0b;
+        }
+
         .main-container {
             flex: 1;
             display: flex;
@@ -265,6 +281,11 @@
 
         .btn-download {
             background: #4ade80;
+            color: white;
+        }
+
+        .btn-curl {
+            background: #fbbf24;
             color: white;
         }
 
@@ -605,6 +626,96 @@
         .upload-size {
             color: #999;
         }
+
+        /* Curl Modal */
+        .curl-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(5px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 3000;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .curl-modal.show {
+            display: flex;
+        }
+
+        .curl-modal-content {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            min-width: 500px;
+            max-width: 700px;
+            animation: slideUp 0.3s ease;
+        }
+
+        .curl-modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 15px;
+        }
+
+        .curl-modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .curl-modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #999;
+            padding: 0 5px;
+        }
+
+        .curl-modal-close:hover {
+            color: #333;
+        }
+
+        .curl-command {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px 40px 15px 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            cursor: pointer;
+            position: relative;
+            user-select: all;
+            transition: outline 0.2s;
+        }
+
+        .curl-command:hover {
+            outline: 2px solid #667eea;
+        }
+
+        .curl-copy-icon {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            font-size: 16px;
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .curl-command:hover .curl-copy-icon {
+            opacity: 1;
+        }
     </style>
 </head>
 
@@ -613,6 +724,7 @@
         <h1>📝 Memory Share</h1>
         <div class="room-info">
             <span class="room-name">Stanza: <strong>{{ room_name }}</strong></span>
+            <button class="btn-curl-upload" onclick="showCurlUpload()">📤 Curl Upload</button>
             <span class="status" id="status">● Connessione...</span>
             <button class="btn-home" onclick="goHome()">🏠 Home</button>
         </div>
@@ -667,6 +779,19 @@
     </div>
 
     <div class="notification" id="notification"></div>
+
+    <!-- Curl Modal -->
+    <div class="curl-modal" id="curlModal">
+        <div class="curl-modal-content">
+            <div class="curl-modal-header">
+                <span class="curl-modal-title" id="curlModalTitle">🔗 Comando curl</span>
+                <button class="curl-modal-close" onclick="closeCurlModal()">&times;</button>
+            </div>
+            <div class="curl-command" id="curlCommandText" onclick="copyCurlCommand()">
+                <span class="curl-copy-icon">📋</span>
+            </div>
+        </div>
+    </div>
 
     <!-- Upload Progress Overlay -->
     <div class="upload-progress-overlay" id="uploadProgressOverlay">
@@ -858,6 +983,7 @@
                     </div>
                     <div class="file-actions">
                         <button class="btn-download" onclick="downloadFile('${escapeHtml(file.name)}')">⬇️</button>
+                        <button class="btn-curl" onclick="showCurlCommand('${escapeHtml(file.name)}')">🔗</button>
                         <button class="btn-delete" onclick="deleteFile('${escapeHtml(file.name)}')">🗑️</button>
                     </div>
                 </div>
@@ -988,6 +1114,54 @@
         function downloadFile(filename) {
             window.location.href = `${SUB_PATH}/room/${roomName}/download/${encodeURIComponent(filename)}`;
         }
+
+        let _currentCurlFilename = '';
+
+        function _curlInsecure() {
+            return window.location.protocol === 'https:' ? ' -k' : '';
+        }
+
+        function showCurlCommand(filename) {
+            _currentCurlFilename = filename;
+            document.getElementById('curlModalTitle').textContent = '🔗 Comando curl download';
+            const baseUrl = window.location.origin;
+            const url = `${baseUrl}${SUB_PATH}/room/${roomName}/download/${encodeURIComponent(filename)}`;
+            const curlCmd = `curl${_curlInsecure()} -L -o "${filename}" "${url}"`;
+            document.getElementById('curlCommandText').textContent = curlCmd;
+            document.getElementById('curlModal').classList.add('show');
+        }
+
+        function showCurlUpload() {
+            document.getElementById('curlModalTitle').textContent = '📤 Comando curl upload';
+            const baseUrl = window.location.origin;
+            const curlCmd = `curl${_curlInsecure()} -F "file=@/percorso/del/tuo/file.txt" "${baseUrl}${SUB_PATH}/room/${roomName}/upload"`;
+            document.getElementById('curlCommandText').textContent = curlCmd;
+            document.getElementById('curlModal').classList.add('show');
+        }
+
+        function closeCurlModal() {
+            document.getElementById('curlModal').classList.remove('show');
+        }
+
+        function copyCurlCommand() {
+            const text = document.getElementById('curlCommandText').textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                showNotification('Comando curl copiato negli appunti!');
+            }).catch(() => {
+                const dummy = document.createElement('input');
+                document.body.appendChild(dummy);
+                dummy.value = text;
+                dummy.select();
+                document.execCommand('copy');
+                document.body.removeChild(dummy);
+                showNotification('Comando curl copiato negli appunti!');
+            });
+        }
+
+        // Close modal on overlay click
+        document.getElementById('curlModal').addEventListener('click', function(e) {
+            if (e.target === this) closeCurlModal();
+        });
 
         async function deleteFile(filename) {
             if (!confirm(`Sei sicuro di voler eliminare "${filename}"?`)) return;
