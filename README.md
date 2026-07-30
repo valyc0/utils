@@ -77,6 +77,9 @@ Vedi [python/memory-share/README.md](python/memory-share/README.md) per dettagli
 #### 🖥️ Remmina (`software/remmina/`)
 Configurazione per desktop remoto con Remmina tramite Docker.
 
+## 📦 proxy tar gz
+codice java e python per avere un proxy http/https locale
+
 ## 📦 Requisiti Generali
 
 - Python 3.6+
