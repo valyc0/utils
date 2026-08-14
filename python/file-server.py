@@ -5,16 +5,26 @@ import io
 import time
 import shutil
 import zipfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import pty
+import select
+import fcntl
+import termios
+import struct
+import uuid
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import html
 import base64
+import signal
 
 class FileServerHandler(BaseHTTPRequestHandler):
     storage_dir = "storage"
     USERNAME = "admin"
     PASSWORD = "admin"
+    enable_terminal = True
+    sessions = {}
 
     # --- Autenticazione HTTP Basic ---
     def do_AUTHHEAD(self):
@@ -68,6 +78,91 @@ class FileServerHandler(BaseHTTPRequestHandler):
         """Formatta un timestamp in data/ora leggibile (gg/mm/aaaa hh:mm)."""
         return time.strftime("%d/%m/%Y %H:%M", time.localtime(ts))
 
+    # --- Gestione terminale interattivo (PTY) ---
+    def term_new(self):
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.storage_dir)
+            env = os.environ.copy()
+            env["TERM"] = "xterm-256color"
+            env["PS1"] = "\\[\\e[32m\\]\\w\\[\\e[0m\\] $ "
+            os.execvpe("/bin/bash", ["/bin/bash", "--norc", "--noprofile"], env)
+        sid = uuid.uuid4().hex
+        self.sessions[sid] = {"pid": pid, "fd": master_fd, "dir": self.storage_dir}
+        body = json.dumps({"sid": sid}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def term_read(self, sid):
+        sess = self.sessions.get(sid)
+        if not sess:
+            return self.send_error(404, "Sessione non trovata")
+        fd = sess["fd"]
+        data = b""
+        try:
+            while True:
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r:
+                    break
+                chunk = os.read(fd, 8192)
+                if not chunk:
+                    break
+                data += chunk
+        except (OSError, ValueError):
+            pass
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def term_write(self, sid):
+        sess = self.sessions.get(sid)
+        if not sess:
+            return self.send_error(404, "Sessione non trovata")
+        length = int(self.headers.get("Content-Length", 0))
+        data = self.rfile.read(length) if length else b""
+        if data:
+            try:
+                os.write(sess["fd"], data)
+            except OSError:
+                pass
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def term_resize(self, sid):
+        sess = self.sessions.get(sid)
+        if not sess:
+            return self.send_error(404, "Sessione non trovata")
+        try:
+            cols = int(self.params.get("cols", ["80"])[0])
+            rows = int(self.params.get("rows", ["24"])[0])
+            fcntl.ioctl(sess["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        except (ValueError, OSError):
+            pass
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def term_close(self, sid):
+        sess = self.sessions.pop(sid, None)
+        if sess:
+            try:
+                os.kill(sess["pid"], signal.SIGHUP)
+            except OSError:
+                pass
+            try:
+                os.close(sess["fd"])
+            except OSError:
+                pass
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     # --- Gestione GET ---
     def do_GET(self):
         if not self.authenticate():
@@ -75,6 +170,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        self.params = params
 
         if parsed.path == "/":
             browse_path = params.get("path", [""])[0]
@@ -150,6 +246,26 @@ class FileServerHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"Errore durante la cancellazione: {e}")
 
+        elif parsed.path == "/term/new":
+            if not self.enable_terminal:
+                return self.send_error(404, "Terminale disabilitato")
+            return self.term_new()
+
+        elif parsed.path == "/term/read":
+            if not self.enable_terminal:
+                return self.send_error(404, "Terminale disabilitato")
+            return self.term_read(params.get("sid", [None])[0])
+
+        elif parsed.path == "/term/resize":
+            if not self.enable_terminal:
+                return self.send_error(404, "Terminale disabilitato")
+            return self.term_resize(params.get("sid", [None])[0])
+
+        elif parsed.path == "/term/close":
+            if not self.enable_terminal:
+                return self.send_error(404, "Terminale disabilitato")
+            return self.term_close(params.get("sid", [None])[0])
+
         else:
             self.send_error(404, "Not found")
 
@@ -160,6 +276,11 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         if parsed.path != "/upload":
+            if parsed.path == "/term/write":
+                if not self.enable_terminal:
+                    return self.send_error(404, "Terminale disabilitato")
+                params = parse_qs(parsed.query)
+                return self.term_write(params.get("sid", [None])[0])
             self.send_error(404, "Not found")
             return
 
@@ -296,6 +417,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         <head>
             <meta charset="UTF-8">
             <title>File Server</title>
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
             <style>
                 body { font-family: sans-serif; margin: 40px; }
                 input[type=file] { margin: 10px 0; }
@@ -310,10 +432,27 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 #crumbs { margin: 8px 0 12px; padding: 8px 12px; background: #f5f5f5; border-radius: 6px; font-size: 0.95em; }
                 #crumbs a { color: #1976d2; text-decoration: none; }
                 #crumbs a:hover { text-decoration: underline; }
+                #term-toggle { margin: 0 0 10px; padding: 8px 14px; border: none; border-radius: 6px; background: #263238; color: #fff; font-size: 0.95em; cursor: pointer; }
+                #term-toggle:hover { background: #37474f; }
+                #term-bar { display: none; align-items: center; margin: 10px 0 0; }
+                #term-bar.active { display: flex; }
+                #term-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+                .term-tab { padding: 6px 12px; border: 1px solid #455a64; border-radius: 6px 6px 0 0; background: #eceff1; cursor: pointer; font-size: 0.9em; user-select: none; }
+                .term-tab.active { background: #263238; color: #fff; }
+                .term-tab .close { margin-left: 8px; color: #999; cursor: pointer; font-weight: bold; }
+                .term-tab .close:hover { color: #d32f2f; }
+                #term-add { margin-left: 8px; padding: 6px 12px; border: none; border-radius: 6px; background: #4caf50; color: #fff; cursor: pointer; font-size: 0.95em; }
+                #term-add:hover { background: #388e3c; }
+                #term-container { margin-bottom: 10px; }
+                .term-view { display: none; position: relative; height: 360px; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; }
+                .term-view.active { display: block; }
+                .term-resize-handle { position: absolute; left: 0; right: 0; bottom: 0; height: 8px; cursor: ns-resize; z-index: 10; background: rgba(255,255,255,0.12); border-top: 1px solid #455a64; border-radius: 0 0 6px 6px; }
+                .term-resize-handle:hover { background: #37474f; }
             </style>
         </head>
         <body>
             <h1>📁 File Server</h1>
+            {TERM_UI}
             <div id="crumbs">{CRUMBS}</div>
 
             <div id="drop-zone" data-path="{CURPATH}">📂 Trascina qui file o cartelle intere</div>
@@ -447,13 +586,262 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     xhr.send(formData);
                 }
             </script>
+            {TERM_SCRIPTS}
         </body>
         </html>
         """
+        TERM_UI = """<div><button id="term-toggle">🖥️ Apri terminale</button></div>
+        <div id="term-bar">
+            <div id="term-tabs"></div>
+            <button id="term-add" title="Nuovo terminale">＋</button>
+        </div>
+        <div id="term-container"></div>"""
+
+        TERM_SCRIPTS = """<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js"></script>
+        <script>
+                var termBtn = document.getElementById("term-toggle");
+                var termBar = document.getElementById("term-bar");
+                var termTabs = document.getElementById("term-tabs");
+                var termContainer = document.getElementById("term-container");
+                var termAddBtn = document.getElementById("term-add");
+                var terms = [];
+                var activeTerm = null;
+                var termCounter = 0;
+
+                termBtn.addEventListener("click", function () {
+                    if (terms.length) {
+                        closeAllTerms();
+                    } else {
+                        openTerm();
+                    }
+                });
+
+                termAddBtn.addEventListener("click", openTerm);
+
+                function openTerm() {
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/term/new", true);
+                    xhr.onload = function () {
+                        if (xhr.status === 200) {
+                            var resp = JSON.parse(xhr.responseText);
+                            termCounter++;
+                            var t = {
+                                id: termCounter,
+                                sid: resp.sid,
+                                term: null,
+                                fit: null,
+                                poll: null,
+                                div: null,
+                                tab: null,
+                                closeBtn: null
+                            };
+                            t.div = document.createElement("div");
+                            t.div.className = "term-view";
+                            termContainer.appendChild(t.div);
+
+                            t.tab = document.createElement("div");
+                            t.tab.className = "term-tab";
+                            t.tab.textContent = "Terminale " + t.id + " ";
+                            t.closeBtn = document.createElement("span");
+                            t.closeBtn.className = "close";
+                            t.closeBtn.textContent = "✕";
+                            t.tab.appendChild(t.closeBtn);
+                            t.tab.addEventListener("click", function () { activateTerm(t); });
+                            t.closeBtn.addEventListener("click", function (e) {
+                                e.stopPropagation();
+                                closeTerm(t);
+                            });
+                            termTabs.appendChild(t.tab);
+
+                            t.term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: "Menlo, Monaco, Consolas, monospace" });
+                            t.fit = new FitAddon.FitAddon();
+                            t.term.loadAddon(t.fit);
+                            t.term.open(t.div);
+                            t.observer = new ResizeObserver(function () {
+                                if (t.div.offsetHeight > 0) fitTerm(t);
+                            });
+                            t.observer.observe(t.div);
+                            t.handle = document.createElement("div");
+                            t.handle.className = "term-resize-handle";
+                            t.handle.title = "Trascina per ridimensionare l'altezza";
+                            t.handle.addEventListener("mousedown", startResize(t));
+                            t.div.appendChild(t.handle);
+                            t.term.onData(function (data) {
+                                var w = new XMLHttpRequest();
+                                w.open("POST", "/term/write?sid=" + encodeURIComponent(t.sid), true);
+                                w.setRequestHeader("Content-Type", "application/octet-stream");
+                                w.send(data);
+                            });
+                            t.poll = setInterval(function () { pollTerm(t); }, 100);
+                            registerOsc52(t.term);
+                            terms.push(t);
+                            activateTerm(t);
+                            termBar.classList.add("active");
+                            updateTermToggle();
+                            termFocus();
+                        }
+                    };
+                    xhr.send();
+                }
+
+                function activateTerm(t) {
+                    if (activeTerm && activeTerm !== t) {
+                        activeTerm.div.classList.remove("active");
+                        activeTerm.tab.classList.remove("active");
+                    }
+                    activeTerm = t;
+                    t.div.classList.add("active");
+                    t.tab.classList.add("active");
+                    fitTerm(t);
+                    termFocus();
+                }
+
+                function closeTerm(t) {
+                    var idx = terms.indexOf(t);
+                    if (idx !== -1) terms.splice(idx, 1);
+                    if (t.poll) { clearInterval(t.poll); t.poll = null; }
+                    if (t.sid) {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open("GET", "/term/close?sid=" + encodeURIComponent(t.sid), true);
+                        xhr.send();
+                    }
+                    if (t.term) { t.term.dispose(); t.term = null; }
+                    if (t.observer) { t.observer.disconnect(); t.observer = null; }
+                    if (t.tab) t.tab.remove();
+                    if (t.div) t.div.remove();
+                    if (activeTerm === t) {
+                        activeTerm = terms.length ? terms[terms.length - 1] : null;
+                        if (activeTerm) activateTerm(activeTerm);
+                        else updateTermToggle();
+                    }
+                }
+
+                function closeAllTerms() {
+                    while (terms.length) closeTerm(terms[terms.length - 1]);
+                    termBar.classList.remove("active");
+                    updateTermToggle();
+                }
+
+                function updateTermToggle() {
+                    if (terms.length) {
+                        termBtn.textContent = "✖ Chiudi terminali";
+                    } else {
+                        termBtn.textContent = "🖥️ Apri terminale";
+                    }
+                }
+
+                function copyTextToClipboard(text) {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(text).catch(function () { legacyCopy(text); });
+                    } else {
+                        legacyCopy(text);
+                    }
+                }
+
+                function legacyCopy(text) {
+                    var ta = document.createElement("textarea");
+                    ta.value = text;
+                    ta.style.position = "fixed";
+                    ta.style.opacity = "0";
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    try { document.execCommand("copy"); } catch (e) {}
+                    document.body.removeChild(ta);
+                }
+
+                function decodeOsc52B64(b64) {
+                    b64 = b64.replace(/-/g, "+").replace(/_/g, "/");
+                    while (b64.length % 4) b64 += "=";
+                    try {
+                        return decodeURIComponent(escape(atob(b64)));
+                    } catch (e) {
+                        try { return atob(b64); } catch (e2) { return ""; }
+                    }
+                }
+
+                function registerOsc52(termInstance) {
+                    if (termInstance.parser && termInstance.parser.registerOscHandler) {
+                        termInstance.parser.registerOscHandler(52, function (data) {
+                            var parts = String(data).split(";");
+                            var b64 = parts[parts.length - 1];
+                            if (b64 && b64 !== "?") {
+                                copyTextToClipboard(decodeOsc52B64(b64));
+                            }
+                            return true;
+                        });
+                    }
+                }
+
+                function pollTerm(t) {
+                    if (!t.sid) return;
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/term/read?sid=" + encodeURIComponent(t.sid), true);
+                    xhr.onload = function () {
+                        if (xhr.status === 200 && xhr.response) {
+                            t.term.write(xhr.response);
+                        }
+                    };
+                    xhr.send();
+                }
+
+                function fitTerm(t) {
+                    if (t && t.term && t.fit) {
+                        t.fit.fit();
+                        if (t.sid && (t.term.cols !== t.lastCols || t.term.rows !== t.lastRows)) {
+                            t.lastCols = t.term.cols;
+                            t.lastRows = t.term.rows;
+                            var xhr = new XMLHttpRequest();
+                            xhr.open("GET", "/term/resize?sid=" + encodeURIComponent(t.sid) + "&cols=" + t.term.cols + "&rows=" + t.term.rows, true);
+                            xhr.send();
+                        }
+                    }
+                }
+
+                function startResize(t) {
+                    return function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        var startY = e.clientY;
+                        var startH = t.div.offsetHeight;
+                        var moving = false;
+                        function onMove(ev) {
+                            moving = true;
+                            var h = startH + (ev.clientY - startY);
+                            if (h < 120) h = 120;
+                            t.div.style.height = h + "px";
+                            fitTerm(t);
+                        }
+                        function onUp() {
+                            document.removeEventListener("mousemove", onMove);
+                            document.removeEventListener("mouseup", onUp);
+                            document.body.style.cursor = "";
+                            document.body.style.userSelect = "";
+                        }
+                        document.addEventListener("mousemove", onMove);
+                        document.addEventListener("mouseup", onUp);
+                        document.body.style.cursor = "ns-resize";
+                        document.body.style.userSelect = "none";
+                    };
+                }
+
+                window.addEventListener("resize", function () {
+                    if (activeTerm) fitTerm(activeTerm);
+                });
+
+                function termFocus() {
+                    if (activeTerm && activeTerm.term) activeTerm.term.focus();
+                }
+        </script>"""
         html_content = index_template.replace(
             "{ROWS}",
             rows if rows else "<tr><td colspan='4'>Nessun contenuto presente</td></tr>"
         ).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", html.escape(browse_path))
+        if FileServerHandler.enable_terminal:
+            html_content = html_content.replace("{TERM_UI}", TERM_UI).replace("{TERM_SCRIPTS}", TERM_SCRIPTS)
+        else:
+            html_content = html_content.replace("{TERM_UI}", "").replace("{TERM_SCRIPTS}", "")
         data = html_content.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -463,15 +851,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
 
 # --- Avvio del server ---
-def run_server(port=8080, directory="storage", user="admin", password="admin"):
+def run_server(port=8080, directory="storage", user="admin", password="admin", enable_terminal=True):
     FileServerHandler.storage_dir = directory
     FileServerHandler.USERNAME = user
     FileServerHandler.PASSWORD = password
+    FileServerHandler.enable_terminal = enable_terminal
     Path(directory).mkdir(parents=True, exist_ok=True)
-    server = HTTPServer(("", port), FileServerHandler)
+    server = ThreadingHTTPServer(("", port), FileServerHandler)
     print(f"✅ Server avviato su http://localhost:{port}")
     print(f"📂 Directory di upload: {Path(directory).absolute()}")
     print(f"🔑 Username: {user}, Password: {password}")
+    print(f"🖥️ Terminale: {'attivo' if enable_terminal else 'disabilitato (--no-terminal)'}")
     print("\n💡 Esempio di utilizzo completo:")
     print(f"python3 {sys.argv[0]} 8080 storage admin admin")
     print("Parametri:")
@@ -535,4 +925,6 @@ if __name__ == "__main__":
         user = sys.argv[3]
         password = sys.argv[4]
 
-    run_server(port, directory, user, password)
+    enable_terminal = "--no-terminal" not in sys.argv
+
+    run_server(port, directory, user, password, enable_terminal)
