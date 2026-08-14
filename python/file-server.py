@@ -246,6 +246,46 @@ class FileServerHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"Errore durante la cancellazione: {e}")
 
+        elif parsed.path == "/edit":
+            filename = params.get("file", [None])[0]
+            if not filename:
+                return self.send_error(400, "Parametro 'file' mancante. Usa ?file=nomefile")
+            target = self.resolve_in_storage(filename)
+            if target is None or not target.is_file():
+                return self.send_error(404, "File non trovato")
+            if target.stat().st_size > 512 * 1024:
+                return self.send_error(413, "File troppo grande per l'editor (max 512KB)")
+            data = target.read_bytes()
+            if b"\x00" in data:
+                return self.send_error(400, "File binario, non modificabile con l'editor")
+            body = json.dumps({"name": filename, "content": data.decode("utf-8", errors="replace")}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path.startswith("/static/"):
+            rel = parsed.path[len("/static/"):]
+            base = Path(__file__).resolve().parent / "static"
+            target = (base / rel).resolve()
+            if base != target and base not in target.parents:
+                return self.send_error(403, "Forbidden")
+            if not target.is_file():
+                return self.send_error(404, "Not found")
+            ctype = {
+                ".js": "application/javascript",
+                ".css": "text/css",
+                ".map": "application/json",
+            }.get(target.suffix, "application/octet-stream")
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+
         elif parsed.path == "/term/new":
             if not self.enable_terminal:
                 return self.send_error(404, "Terminale disabilitato")
@@ -275,6 +315,32 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
+        if parsed.path == "/save":
+            ctype = self.headers.get("Content-Type", "")
+            if "application/json" not in ctype:
+                return self.send_error(400, "Content-Type deve essere application/json")
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self.send_error(400, "JSON non valido")
+            filename = payload.get("path")
+            content = payload.get("content")
+            if not isinstance(filename, str) or not isinstance(content, str):
+                return self.send_error(400, "Campi 'path' e 'content' obbligatori (stringhe)")
+            target = self.resolve_in_storage(filename)
+            if target is None:
+                return self.send_error(400, "Percorso non valido")
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            except OSError as e:
+                return self.send_error(500, f"Errore durante il salvataggio: {e}")
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if parsed.path != "/upload":
             if parsed.path == "/term/write":
                 if not self.enable_terminal:
@@ -378,13 +444,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
         )
 
         # Breadcrumb per la navigazione
-        crumbs = [('<a href="/">🏠 Root</a>', "")]
+        crumbs = [('<a href="/" class="nav-link" data-path="">🏠 Root</a>', "")]
         acc = ""
         for part in browse_path.split("/"):
             if not part:
                 continue
             acc = f"{acc}/{part}" if acc else part
-            crumbs.append((f"<a href='/?path={html.escape(acc)}'>{html.escape(part)}</a>", acc))
+            crumbs.append((f"<a href='/?path={html.escape(acc)}' class='nav-link' data-path='{html.escape(acc)}'>{html.escape(part)}</a>", acc))
         crumb_html = " / ".join(c for c, _ in crumbs)
         if browse_path:
             crumb_html += f" <a href='/download-dir?dir={html.escape(browse_path)}'>⬇️ Scarica cartella ZIP</a>"
@@ -398,15 +464,27 @@ class FileServerHandler(BaseHTTPRequestHandler):
             date = self.format_date(st.st_mtime)
             if p.is_dir():
                 rows += (
-                    f"<tr><td>📁 <a href='/?path={html.escape(rel)}'>{html.escape(name)}/</a></td>"
+                    f"<tr><td>📁 <a href='/?path={html.escape(rel)}' class='nav-link' data-path='{html.escape(rel)}'>{html.escape(name)}/</a></td>"
                     f"<td>{size}</td><td>{date}</td>"
-                    f"<td><a href='/?path={html.escape(rel)}'>Apri</a> "
+                    f"<td><a href='/?path={html.escape(rel)}' class='nav-link' data-path='{html.escape(rel)}'>Apri</a> "
                     f"<a href='/download-dir?dir={html.escape(rel)}'>Scarica ZIP</a> "
                     f"<a href='/delete?file={html.escape(rel)}' onclick='return confirm(\"Confermi cancellazione cartella {html.escape(rel)}?\");'>[Elimina]</a></td></tr>"
                 )
             else:
+                is_text = False
+                if st.st_size <= 512 * 1024:
+                    try:
+                        head = p.open("rb").read(4096)
+                        is_text = b"\x00" not in head
+                    except OSError:
+                        pass
+                name_link = (
+                    f"<a href='#' class='edit-link' data-file='{html.escape(rel)}' title='Apri nell\\'editor'>{html.escape(name)}</a>"
+                    if is_text else
+                    f"<a href='/download?file={html.escape(rel)}'>{html.escape(name)}</a>"
+                )
                 rows += (
-                    f"<tr><td>📄 <a href='/download?file={html.escape(rel)}'>{html.escape(name)}</a></td>"
+                    f"<tr><td>📄 {name_link}</td>"
                     f"<td>{size}</td><td>{date}</td>"
                     f"<td><a href='/download?file={html.escape(rel)}'>Scarica</a> "
                     f"<a href='/delete?file={html.escape(rel)}' onclick='return confirm(\"Confermi cancellazione {html.escape(rel)}?\");'>[Elimina]</a></td></tr>"
@@ -417,64 +495,116 @@ class FileServerHandler(BaseHTTPRequestHandler):
         <head>
             <meta charset="UTF-8">
             <title>File Server</title>
-            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+            <link rel="stylesheet" href="/static/xterm/xterm.css">
+            <link rel="stylesheet" href="/static/codemirror/lib/codemirror.css">
             <style>
-                body { font-family: sans-serif; margin: 40px; }
+                body { font-family: sans-serif; margin: 0; height: 100vh; display: flex; flex-direction: column; background: #fafafa; }
+                header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #263238; color: #fff; flex-shrink: 0; }
+                header h1 { margin: 0; font-size: 1.2em; }
+                #term-toggle { padding: 8px 14px; border: none; border-radius: 6px; background: #4caf50; color: #fff; font-size: 0.95em; cursor: pointer; }
+                #term-toggle:hover { background: #388e3c; }
+                #layout { flex: 1; display: flex; min-height: 0; }
+                #left-panel { width: 420px; min-width: 260px; flex-shrink: 0; display: flex; background: #fff; }
+                #left-scroll { flex: 1; overflow: auto; padding: 16px 20px; }
+                #vsplitter { width: 6px; cursor: col-resize; background: #cfd8dc; flex-shrink: 0; }
+                #vsplitter:hover { background: #90a4ae; }
+                #right-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #fff; }
+                #term-wrap { display: none; flex-direction: column; min-height: 120px; flex-shrink: 0; }
+                #term-wrap.active { display: flex; }
+                #hsplitter { display: none; height: 6px; cursor: row-resize; background: #cfd8dc; flex-shrink: 0; }
+                #hsplitter.active { display: block; }
+                #hsplitter:hover { background: #90a4ae; }
+                #editor-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+                #editor-tabs { display: flex; gap: 4px; padding: 6px 10px; background: #37474f; overflow-x: auto; flex-shrink: 0; }
+                .ed-tab { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #546e7a; color: #fff; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 0.85em; white-space: nowrap; max-width: 220px; user-select: none; }
+                .ed-tab.active { background: #263238; }
+                .ed-tab span { overflow: hidden; text-overflow: ellipsis; }
+                .ed-tab-close { color: #cfd8dc; font-weight: bold; }
+                .ed-tab-close:hover { color: #ef5350; }
+                #editor-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #eceff1; border-bottom: 1px solid #cfd8dc; }
+                #editor-title { font-weight: bold; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.95em; }
+                #editor-status { font-size: 0.85em; color: #f9a825; }
+                #editor-save { padding: 6px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; background: #4caf50; color: #fff; }
+                #editor-save:hover { background: #388e3c; }
+                #editor-host { flex: 1; position: relative; overflow: hidden; }
+                #editor-host .CodeMirror { position: absolute; inset: 0; height: 100%; font-size: 14px; }
+                #editor-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #90a4ae; font-size: 1.1em; text-align: center; }
                 input[type=file] { margin: 10px 0; }
-                table { border-collapse: collapse; margin-top: 10px; }
-                th, td { text-align: left; padding: 4px 14px 4px 0; border-bottom: 1px solid #eee; }
-                th { font-size: 0.9em; color: #666; }
-                #drop-zone { border: 2px dashed #aaa; border-radius: 8px; padding: 30px; text-align: center; color: #666; margin: 20px 0; cursor: pointer; }
+                table { border-collapse: collapse; margin-top: 10px; width: 100%; }
+                th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid #eee; font-size: 0.92em; }
+                th { font-size: 0.85em; color: #666; }
+                #drop-zone { border: 2px dashed #aaa; border-radius: 8px; padding: 24px 16px; text-align: center; color: #666; margin: 16px 0; cursor: pointer; font-size: 0.95em; }
                 #drop-zone.dragover { border-color: #4caf50; background: #e8f5e9; color: #2e7d32; }
                 #status { display: none; margin: 10px 0; padding: 10px; background: #fff3cd; border-radius: 4px; }
                 .progress { display: none; width: 100%; background: #eee; border-radius: 4px; height: 16px; margin: 10px 0; }
                 .progress > div { height: 100%; width: 0%; background: #4caf50; border-radius: 4px; }
-                #crumbs { margin: 8px 0 12px; padding: 8px 12px; background: #f5f5f5; border-radius: 6px; font-size: 0.95em; }
+                #crumbs { margin: 8px 0 12px; padding: 8px 12px; background: #f5f5f5; border-radius: 6px; font-size: 0.9em; word-break: break-all; }
                 #crumbs a { color: #1976d2; text-decoration: none; }
                 #crumbs a:hover { text-decoration: underline; }
-                #term-toggle { margin: 0 0 10px; padding: 8px 14px; border: none; border-radius: 6px; background: #263238; color: #fff; font-size: 0.95em; cursor: pointer; }
-                #term-toggle:hover { background: #37474f; }
-                #term-bar { display: none; align-items: center; margin: 10px 0 0; }
-                #term-bar.active { display: flex; }
+                #term-bar { display: flex; align-items: center; padding: 8px 10px 0; gap: 4px; background: #263238; }
                 #term-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-                .term-tab { padding: 6px 12px; border: 1px solid #455a64; border-radius: 6px 6px 0 0; background: #eceff1; cursor: pointer; font-size: 0.9em; user-select: none; }
+                .term-tab { padding: 6px 12px; border: 1px solid #455a64; border-bottom: none; border-radius: 6px 6px 0 0; background: #eceff1; cursor: pointer; font-size: 0.9em; user-select: none; }
                 .term-tab.active { background: #263238; color: #fff; }
                 .term-tab .close { margin-left: 8px; color: #999; cursor: pointer; font-weight: bold; }
                 .term-tab .close:hover { color: #d32f2f; }
-                #term-add { margin-left: 8px; padding: 6px 12px; border: none; border-radius: 6px; background: #4caf50; color: #fff; cursor: pointer; font-size: 0.95em; }
+                #term-add { padding: 6px 12px; border: none; border-radius: 6px; background: #4caf50; color: #fff; cursor: pointer; font-size: 0.9em; margin-left: 4px; }
                 #term-add:hover { background: #388e3c; }
-                #term-container { margin-bottom: 10px; }
-                .term-view { display: none; position: relative; height: 360px; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; }
+                #term-container { flex: 1; min-height: 0; padding: 0 8px 8px; }
+                .term-view { display: none; position: relative; height: 100%; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; box-sizing: border-box; }
                 .term-view.active { display: block; }
-                .term-resize-handle { position: absolute; left: 0; right: 0; bottom: 0; height: 8px; cursor: ns-resize; z-index: 10; background: rgba(255,255,255,0.12); border-top: 1px solid #455a64; border-radius: 0 0 6px 6px; }
-                .term-resize-handle:hover { background: #37474f; }
+                #new-file-btn { margin: 12px 0; padding: 8px 14px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.95em; cursor: pointer; }
+                #new-file-btn:hover { background: #6a1b9a; }
             </style>
         </head>
         <body>
-            <h1>📁 File Server</h1>
-            {TERM_UI}
-            <div id="crumbs">{CRUMBS}</div>
+            <header>
+                <h1>📁 File Server</h1>
+                {TERM_TOGGLE}
+            </header>
+            <div id="layout">
+                <div id="left-panel">
+                    <div id="left-scroll">
+                        <div id="crumbs">{CRUMBS}</div>
 
-            <div id="drop-zone" data-path="{CURPATH}">📂 Trascina qui file o cartelle intere</div>
-            <div id="status"></div>
-            <div class="progress"><div id="progress-bar"></div></div>
+                        <div id="drop-zone" data-path="{CURPATH}">📂 Trascina qui file o cartelle intere</div>
+                        <div id="status"></div>
+                        <div class="progress"><div id="progress-bar"></div></div>
 
-            <form method="POST" enctype="multipart/form-data" action="/upload">
-                <input type="hidden" name="path" value="{CURPATH}">
-                <input type="file" name="file" multiple>
-                <input type="submit" value="Carica file">
-            </form>
-            <form method="POST" enctype="multipart/form-data" action="/upload">
-                <input type="hidden" name="path" value="{CURPATH}">
-                <input type="file" name="file" webkitdirectory multiple>
-                <input type="submit" value="Carica cartella">
-            </form>
+                        <form method="POST" enctype="multipart/form-data" action="/upload">
+                            <input type="hidden" name="path" value="{CURPATH}">
+                            <input type="file" name="file" multiple>
+                            <input type="submit" value="Carica file">
+                        </form>
+                        <form method="POST" enctype="multipart/form-data" action="/upload">
+                            <input type="hidden" name="path" value="{CURPATH}">
+                            <input type="file" name="file" webkitdirectory multiple>
+                            <input type="submit" value="Carica cartella">
+                        </form>
+                        <div><button id="new-file-btn">➕ Nuovo file</button></div>
 
-            <h2>Contenuti disponibili</h2>
-            <table>
-                <thead><tr><th>Nome</th><th>Dimensione</th><th>Data modifica</th><th>Azioni</th></tr></thead>
-                <tbody>{ROWS}</tbody>
-            </table>
+                        <h2>Contenuti disponibili</h2>
+                        <table>
+                            <thead><tr><th>Nome</th><th>Dimensione</th><th>Data modifica</th><th>Azioni</th></tr></thead>
+                            <tbody>{ROWS}</tbody>
+                        </table>
+                    </div>
+                </div>
+                <div id="vsplitter" title="Ridimensiona pannelli"></div>
+                <div id="right-panel">
+                    {TERM_UI}
+                    <div id="editor-panel">
+                        <div id="editor-tabs"></div>
+                        <div id="editor-bar">
+                            <span id="editor-title">Editor</span>
+                            <span id="editor-status"></span>
+                            <button id="editor-save">💾 Salva</button>
+                        </div>
+                        <div id="editor-host">
+                            <div id="editor-placeholder">Seleziona un file (✏️ Modifica) o creane uno nuovo (➕ Nuovo file)</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
 
             <script>
                 var dropZone = document.getElementById("drop-zone");
@@ -586,19 +716,352 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     xhr.send(formData);
                 }
             </script>
+            <script src="/static/codemirror/lib/codemirror.min.js"></script>
+            <script src="/static/codemirror/mode/shell.min.js"></script>
+            <script src="/static/codemirror/mode/python.min.js"></script>
+            <script src="/static/codemirror/mode/javascript.min.js"></script>
+            <script src="/static/codemirror/mode/markdown.min.js"></script>
+            <script src="/static/codemirror/mode/htmlmixed.min.js"></script>
+            <script src="/static/codemirror/mode/css.min.js"></script>
+            <script src="/static/codemirror/mode/xml.min.js"></script>
+            <script>
+                var curPath = document.getElementById("drop-zone").getAttribute("data-path") || "";
+                var editorTabs = document.getElementById("editor-tabs");
+                var editorTitle = document.getElementById("editor-title");
+                var editorStatus = document.getElementById("editor-status");
+                var editorHost = document.getElementById("editor-host");
+                var editorSave = document.getElementById("editor-save");
+                var cm = null;
+                var openTabs = [];
+                var activeTab = null;
+
+                function editorSetStatus(msg, color) {
+                    editorStatus.textContent = msg || "";
+                    editorStatus.style.color = color || "#f9a825";
+                }
+
+                function pickMode(name) {
+                    var ext = (name || "").split(".").pop().toLowerCase();
+                    var map = {
+                        "py": "python", "sh": "shell", "bash": "shell",
+                        "js": "javascript", "mjs": "javascript", "cjs": "javascript",
+                        "md": "markdown", "json": "javascript",
+                        "html": "htmlmixed", "htm": "htmlmixed",
+                        "css": "css", "xml": "xml", "svg": "xml"
+                    };
+                    return map[ext] || null;
+                }
+
+                function refreshEditor() {
+                    if (cm) setTimeout(function () { cm.refresh(); }, 10);
+                }
+
+                function findTab(name) {
+                    for (var i = 0; i < openTabs.length; i++) {
+                        if (openTabs[i].name === name) return openTabs[i];
+                    }
+                    return null;
+                }
+
+                function saveActiveContent() {
+                    if (!activeTab) return;
+                    if (cm) activeTab.content = cm.getValue();
+                    else {
+                        var ta = document.getElementById("cm-fallback");
+                        if (ta) activeTab.content = ta.value;
+                    }
+                }
+
+                function renderTabs() {
+                    editorTabs.innerHTML = "";
+                    for (var i = 0; i < openTabs.length; i++) {
+                        (function (t) {
+                            var tab = document.createElement("div");
+                            tab.className = "ed-tab" + (t === activeTab ? " active" : "");
+                            tab.title = t.name;
+                            var label = document.createElement("span");
+                            label.textContent = t.name;
+                            tab.appendChild(label);
+                            var close = document.createElement("span");
+                            close.className = "ed-tab-close";
+                            close.textContent = "✕";
+                            close.addEventListener("click", function (e) { e.stopPropagation(); closeTab(t); });
+                            tab.appendChild(close);
+                            tab.addEventListener("click", function () { activateTab(t); });
+                            editorTabs.appendChild(tab);
+                        })(openTabs[i]);
+                    }
+                }
+
+                function showPlaceholder() {
+                    editorTitle.textContent = "Editor";
+                    editorSetStatus("");
+                    editorHost.innerHTML = "<div id='editor-placeholder'>Clicca su un file per aprirlo nell'editor, o creane uno nuovo (➕ Nuovo file)</div>";
+                }
+
+                function createEditor(name, content) {
+                    editorTitle.textContent = "✏️ " + name;
+                    editorSetStatus("");
+                    if (typeof CodeMirror === "undefined") {
+                        editorHost.innerHTML = "<textarea style='width:100%;height:100%;font-family:monospace;font-size:14px;' id='cm-fallback'></textarea>";
+                        var ta = document.getElementById("cm-fallback");
+                        ta.value = content;
+                        cm = null;
+                    } else {
+                        if (cm) {
+                            var we = cm.getWrapperElement ? cm.getWrapperElement() : null;
+                            if (we && we.parentNode) we.parentNode.removeChild(we);
+                            cm = null;
+                        }
+                        editorHost.innerHTML = "";
+                        var mode = pickMode(name);
+                        if (!(window.CodeMirror && CodeMirror.modes && mode && CodeMirror.modes[mode])) mode = null;
+                        try {
+                            cm = CodeMirror(editorHost, {
+                                value: content,
+                                lineNumbers: true,
+                                mode: mode || "text/plain",
+                                matchBrackets: true,
+                                indentUnit: 4,
+                                lineWrapping: true
+                            });
+                            setTimeout(function () { cm.refresh(); cm.focus(); }, 10);
+                        } catch (err) {
+                            cm = null;
+                            editorHost.innerHTML = "<textarea style='width:100%;height:100%;font-family:monospace;font-size:14px;' id='cm-fallback'></textarea>";
+                            var ta = document.getElementById("cm-fallback");
+                            ta.value = content;
+                        }
+                    }
+                }
+
+                function activateTab(t) {
+                    if (t === activeTab) return;
+                    if (activeTab) saveActiveContent();
+                    activeTab = t;
+                    createEditor(t.name, t.content);
+                    renderTabs();
+                }
+
+                function openEditor(name, content) {
+                    var existing = findTab(name);
+                    if (existing) {
+                        activateTab(existing);
+                        return;
+                    }
+                    if (activeTab) saveActiveContent();
+                    activeTab = { name: name, content: content };
+                    openTabs.push(activeTab);
+                    createEditor(activeTab.name, activeTab.content);
+                    renderTabs();
+                }
+
+                function closeTab(t) {
+                    var wasActive = (t === activeTab);
+                    if (wasActive) saveActiveContent();
+                    var idx = openTabs.indexOf(t);
+                    if (idx !== -1) openTabs.splice(idx, 1);
+                    if (wasActive) {
+                        if (cm) {
+                            var we = cm.getWrapperElement ? cm.getWrapperElement() : null;
+                            if (we && we.parentNode) we.parentNode.removeChild(we);
+                            cm = null;
+                        }
+                        editorHost.innerHTML = "";
+                        activeTab = openTabs.length ? openTabs[Math.min(idx, openTabs.length - 1)] : null;
+                        if (activeTab) createEditor(activeTab.name, activeTab.content);
+                        else showPlaceholder();
+                    }
+                    renderTabs();
+                }
+
+                function currentContent() {
+                    saveActiveContent();
+                    return activeTab ? activeTab.content : "";
+                }
+
+                function navigateTo(path) {
+                    curPath = path || "";
+                    document.getElementById("drop-zone").setAttribute("data-path", curPath);
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/?path=" + encodeURIComponent(curPath), true);
+                    xhr.onload = function () {
+                        if (xhr.status === 200) {
+                            var doc = new DOMParser().parseFromString(xhr.responseText, "text/html");
+                            var tbody = doc.querySelector("table tbody");
+                            if (tbody) document.querySelector("table tbody").innerHTML = tbody.innerHTML;
+                            var crumbs = doc.querySelector("#crumbs");
+                            if (crumbs) document.querySelector("#crumbs").innerHTML = crumbs.innerHTML;
+                        }
+                    };
+                    xhr.send();
+                }
+
+                function refreshFileList() {
+                    navigateTo(curPath);
+                }
+
+                document.addEventListener("click", function (e) {
+                    var link = e.target.closest ? e.target.closest(".nav-link") : null;
+                    if (!link) return;
+                    e.preventDefault();
+                    navigateTo(link.getAttribute("data-path") || "");
+                });
+
+                document.querySelectorAll("form[action='/upload']").forEach(function (f) {
+                    f.addEventListener("submit", function (e) {
+                        e.preventDefault();
+                        var fd = new FormData(f);
+                        statusEl.textContent = "⏳ Caricamento...";
+                        var xhr = new XMLHttpRequest();
+                        xhr.open("POST", "/upload", true);
+                        xhr.onload = function () {
+                            statusEl.textContent = xhr.status === 200 ? "✅ Caricato" : "❌ Errore (HTTP " + xhr.status + ")";
+                            if (xhr.status === 200) refreshFileList();
+                        };
+                        xhr.send(fd);
+                    });
+                });
+
+                editorSave.addEventListener("click", function () {
+                    if (!activeTab) return;
+                    editorSetStatus("⏳ Salvataggio...");
+                    var payload = JSON.stringify({ path: activeTab.name, content: currentContent() });
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("POST", "/save", true);
+                    xhr.setRequestHeader("Content-Type", "application/json");
+                    xhr.onload = function () {
+                        if (xhr.status === 200) {
+                            editorSetStatus("✅ Salvato");
+                            refreshFileList();
+                            setTimeout(function () { editorSetStatus(""); }, 2000);
+                        } else {
+                            editorSetStatus("❌ Errore salvataggio (HTTP " + xhr.status + ")", "#ef5350");
+                        }
+                    };
+                    xhr.onerror = function () {
+                        editorSetStatus("❌ Errore di rete", "#ef5350");
+                    };
+                    xhr.send(payload);
+                });
+
+                document.addEventListener("keydown", function (e) {
+                    if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
+                        e.preventDefault();
+                        editorSave.click();
+                    }
+                });
+
+                document.addEventListener("click", function (e) {
+                    var link = e.target.closest ? e.target.closest(".edit-link") : null;
+                    if (!link) return;
+                    e.preventDefault();
+                    var file = link.getAttribute("data-file");
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/edit?file=" + encodeURIComponent(file), true);
+                    xhr.onload = function () {
+                        if (xhr.status === 200) {
+                            var resp = JSON.parse(xhr.responseText);
+                            openEditor(resp.name, resp.content);
+                        } else {
+                            alert("Impossibile aprire il file (HTTP " + xhr.status + ")");
+                        }
+                    };
+                    xhr.onerror = function () { alert("Errore di rete"); };
+                    xhr.send();
+                });
+
+                document.getElementById("new-file-btn").addEventListener("click", function () {
+                    var name = prompt("Nome del nuovo file (relativo alla cartella corrente):");
+                    if (!name) return;
+                    if (name.indexOf("/") === -1) {
+                        name = (curPath ? curPath + "/" : "") + name;
+                    }
+                    openEditor(name, "");
+                });
+
+                // --- Splitter ridimensionabili ---
+                var leftPanel = document.getElementById("left-panel");
+                var vsplitter = document.getElementById("vsplitter");
+                var termWrap = document.getElementById("term-wrap");
+                var hsplitter = document.getElementById("hsplitter");
+
+                function refreshFit() {
+                    refreshEditor();
+                    if (typeof fitTerm === "function" && activeTerm) fitTerm(activeTerm);
+                }
+
+                try {
+                    var savedW = parseInt(localStorage.getItem("fs.leftwidth"), 10);
+                    if (savedW > 260) leftPanel.style.width = savedW + "px";
+                    var savedH = parseInt(localStorage.getItem("fs.termheight"), 10);
+                    if (termWrap && savedH > 100) termWrap.style.height = savedH + "px";
+                } catch (e) {}
+
+                vsplitter.addEventListener("mousedown", function (e) {
+                    e.preventDefault();
+                    var startX = e.clientX;
+                    var startW = leftPanel.offsetWidth;
+                    function onMove(ev) {
+                        var w = startW + (ev.clientX - startX);
+                        if (w < 260) w = 260;
+                        if (w > window.innerWidth - 300) w = window.innerWidth - 300;
+                        leftPanel.style.width = w + "px";
+                    }
+                    function onUp() {
+                        document.removeEventListener("mousemove", onMove);
+                        document.removeEventListener("mouseup", onUp);
+                        document.body.style.cursor = "";
+                        document.body.style.userSelect = "";
+                        try { localStorage.setItem("fs.leftwidth", leftPanel.offsetWidth); } catch (e) {}
+                        refreshFit();
+                    }
+                    document.addEventListener("mousemove", onMove);
+                    document.addEventListener("mouseup", onUp);
+                    document.body.style.cursor = "col-resize";
+                    document.body.style.userSelect = "none";
+                });
+
+                if (hsplitter) hsplitter.addEventListener("mousedown", function (e) {
+                    e.preventDefault();
+                    var startY = e.clientY;
+                    var startH = termWrap.offsetHeight;
+                    function onMove(ev) {
+                        var h = startH + (ev.clientY - startY);
+                        if (h < 100) h = 100;
+                        termWrap.style.height = h + "px";
+                    }
+                    function onUp() {
+                        document.removeEventListener("mousemove", onMove);
+                        document.removeEventListener("mouseup", onUp);
+                        document.body.style.cursor = "";
+                        document.body.style.userSelect = "";
+                        try { localStorage.setItem("fs.termheight", termWrap.offsetHeight); } catch (e) {}
+                        refreshFit();
+                    }
+                    document.addEventListener("mousemove", onMove);
+                    document.addEventListener("mouseup", onUp);
+                    document.body.style.cursor = "row-resize";
+                    document.body.style.userSelect = "none";
+                });
+            </script>
             {TERM_SCRIPTS}
         </body>
         </html>
         """
-        TERM_UI = """<div><button id="term-toggle">🖥️ Apri terminale</button></div>
-        <div id="term-bar">
-            <div id="term-tabs"></div>
-            <button id="term-add" title="Nuovo terminale">＋</button>
+        TERM_UI = """<div id="term-wrap">
+            <div id="term-bar">
+                <div id="term-tabs"></div>
+                <button id="term-add" title="Nuovo terminale">＋</button>
+            </div>
+            <div id="term-container"></div>
         </div>
-        <div id="term-container"></div>"""
+        <div id="hsplitter" title="Ridimensiona terminale"></div>"""
 
-        TERM_SCRIPTS = """<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js"></script>
+        TERM_TOGGLE = """<button id="term-toggle">🖥️ Apri terminale</button>"""
+
+        TERM_SCRIPTS = """<script src="/static/xterm/xterm.js"></script>
+        <script src="/static/xterm/addon-fit.js"></script>
         <script>
                 var termBtn = document.getElementById("term-toggle");
                 var termBar = document.getElementById("term-bar");
@@ -610,10 +1073,20 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 var termCounter = 0;
 
                 termBtn.addEventListener("click", function () {
-                    if (terms.length) {
-                        closeAllTerms();
+                    var wrap = document.getElementById("term-wrap");
+                    var split = document.getElementById("hsplitter");
+                    if (wrap.classList.contains("active")) {
+                        if (terms.length) closeAllTerms();
+                        wrap.classList.remove("active");
+                        split.classList.remove("active");
+                        termBtn.textContent = "🖥️ Apri terminale";
                     } else {
-                        openTerm();
+                        if (!wrap.style.height) wrap.style.height = "320px";
+                        if (!terms.length) openTerm();
+                        wrap.classList.add("active");
+                        split.classList.add("active");
+                        termBtn.textContent = "✖ Chiudi terminale";
+                        termFocus();
                     }
                 });
 
@@ -662,11 +1135,6 @@ class FileServerHandler(BaseHTTPRequestHandler):
                                 if (t.div.offsetHeight > 0) fitTerm(t);
                             });
                             t.observer.observe(t.div);
-                            t.handle = document.createElement("div");
-                            t.handle.className = "term-resize-handle";
-                            t.handle.title = "Trascina per ridimensionare l'altezza";
-                            t.handle.addEventListener("mousedown", startResize(t));
-                            t.div.appendChild(t.handle);
                             t.term.onData(function (data) {
                                 var w = new XMLHttpRequest();
                                 w.open("POST", "/term/write?sid=" + encodeURIComponent(t.sid), true);
@@ -724,11 +1192,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 }
 
                 function updateTermToggle() {
-                    if (terms.length) {
-                        termBtn.textContent = "✖ Chiudi terminali";
-                    } else {
-                        termBtn.textContent = "🖥️ Apri terminale";
-                    }
+                    var wrap = document.getElementById("term-wrap");
+                    termBtn.textContent = (wrap && wrap.classList.contains("active")) ? "✖ Chiudi terminale" : "🖥️ Apri terminale";
                 }
 
                 function copyTextToClipboard(text) {
@@ -828,6 +1293,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
                 window.addEventListener("resize", function () {
                     if (activeTerm) fitTerm(activeTerm);
+                    if (typeof refreshEditor === "function") refreshEditor();
                 });
 
                 function termFocus() {
@@ -839,9 +1305,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
             rows if rows else "<tr><td colspan='4'>Nessun contenuto presente</td></tr>"
         ).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", html.escape(browse_path))
         if FileServerHandler.enable_terminal:
-            html_content = html_content.replace("{TERM_UI}", TERM_UI).replace("{TERM_SCRIPTS}", TERM_SCRIPTS)
+            html_content = html_content.replace("{TERM_UI}", TERM_UI).replace("{TERM_SCRIPTS}", TERM_SCRIPTS).replace("{TERM_TOGGLE}", TERM_TOGGLE)
         else:
-            html_content = html_content.replace("{TERM_UI}", "").replace("{TERM_SCRIPTS}", "")
+            html_content = html_content.replace("{TERM_UI}", "").replace("{TERM_SCRIPTS}", "").replace("{TERM_TOGGLE}", "")
         data = html_content.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
