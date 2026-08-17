@@ -552,8 +552,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 #term-container { flex: 1; min-height: 0; padding: 0 8px 8px; }
                 .term-view { display: none; position: relative; height: 100%; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; box-sizing: border-box; }
                 .term-view.active { display: block; }
-                #new-file-btn { margin: 12px 0; padding: 8px 14px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.95em; cursor: pointer; }
-                #new-file-btn:hover { background: #6a1b9a; }
+                #new-file-btn, #refresh-btn { padding: 8px 14px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.95em; cursor: pointer; }
+                #new-file-btn:hover, #refresh-btn:hover { background: #6a1b9a; }
             </style>
         </head>
         <body>
@@ -580,7 +580,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             <input type="file" name="file" webkitdirectory multiple>
                             <input type="submit" value="Carica cartella">
                         </form>
-                        <div><button id="new-file-btn">➕ Nuovo file</button></div>
+                        <div style="display:flex;gap:8px;margin:12px 0">
+                            <button id="new-file-btn">➕ Nuovo file</button>
+                            <button id="refresh-btn">🔄 Aggiorna</button>
+                        </div>
 
                         <h2>Contenuti disponibili</h2>
                         <table>
@@ -703,7 +706,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     xhr.onload = function () {
                         if (xhr.status === 200 || xhr.status === 303) {
                             statusEl.textContent = "✅ Upload completato!";
-                            setTimeout(function () { location.reload(); }, 500);
+                            refreshFileList();
                         } else {
                             statusEl.textContent = "❌ Errore upload (HTTP " + xhr.status + ")";
                             progressWrap.style.display = "none";
@@ -980,6 +983,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     openEditor(name, "");
                 });
 
+                document.getElementById("refresh-btn").addEventListener("click", function () {
+                    refreshFileList();
+                });
+
                 // --- Splitter ridimensionabili ---
                 var leftPanel = document.getElementById("left-panel");
                 var vsplitter = document.getElementById("vsplitter");
@@ -1145,6 +1152,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             registerOsc52(t.term);
                             terms.push(t);
                             activateTerm(t);
+                            setTimeout(function () { fitTerm(t); }, 50);
                             termBar.classList.add("active");
                             updateTermToggle();
                             termFocus();
