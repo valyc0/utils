@@ -17,6 +17,9 @@ from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 import html
 import base64
+import hashlib
+import struct as _struct
+import threading
 import signal
 
 class FileServerHandler(BaseHTTPRequestHandler):
@@ -78,90 +81,199 @@ class FileServerHandler(BaseHTTPRequestHandler):
         """Formatta un timestamp in data/ora leggibile (gg/mm/aaaa hh:mm)."""
         return time.strftime("%d/%m/%Y %H:%M", time.localtime(ts))
 
-    # --- Gestione terminale interattivo (PTY) ---
-    def term_new(self):
-        pid, master_fd = pty.fork()
-        if pid == 0:
-            os.chdir(self.storage_dir)
-            env = os.environ.copy()
-            env["TERM"] = "xterm-256color"
-            env["PS1"] = "\\[\\e[32m\\]\\w\\[\\e[0m\\] $ "
-            os.execvpe("/bin/bash", ["/bin/bash", "--norc", "--noprofile"], env)
-        sid = uuid.uuid4().hex
-        self.sessions[sid] = {"pid": pid, "fd": master_fd, "dir": self.storage_dir}
-        body = json.dumps({"sid": sid}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    # --- WebSocket minimal implementation ---
+    WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def term_read(self, sid):
-        sess = self.sessions.get(sid)
-        if not sess:
-            return self.send_error(404, "Sessione non trovata")
-        fd = sess["fd"]
-        data = b""
+    def ws_handshake(self):
+        key = self.headers.get("Sec-WebSocket-Key", "").strip()
+        if not key:
+            return False
+        accept = base64.b64encode(
+            hashlib.sha1((key + self.WS_GUID).encode()).digest()
+        ).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self._ws_lock = threading.Lock()
+        return True
+
+    def ws_read_frame(self):
         try:
-            while True:
-                r, _, _ = select.select([fd], [], [], 0)
-                if not r:
-                    break
-                chunk = os.read(fd, 8192)
+            b1 = self.rfile.read(1)
+            if not b1:
+                return None, None
+            b2 = self.rfile.read(1)
+            if not b2:
+                return None, None
+            opcode = b1[0] & 0x0F
+            masked = (b2[0] & 0x80) != 0
+            length = b2[0] & 0x7F
+            if length == 126:
+                raw = self.rfile.read(2)
+                if len(raw) < 2:
+                    return None, None
+                length = struct.unpack("!H", raw)[0]
+            elif length == 127:
+                raw = self.rfile.read(8)
+                if len(raw) < 8:
+                    return None, None
+                length = struct.unpack("!Q", raw)[0]
+            mask_key = None
+            if masked:
+                mask_key = self.rfile.read(4)
+                if len(mask_key) < 4:
+                    return None, None
+            payload = b""
+            while len(payload) < length:
+                chunk = self.rfile.read(length - len(payload))
                 if not chunk:
-                    break
-                data += chunk
+                    return None, None
+                payload += chunk
+            if mask_key:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x08:
+                return "close", b""
+            return opcode, payload
+        except (OSError, ValueError):
+            return None, None
+
+    def ws_send_frame(self, opcode, payload):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        frame = bytearray()
+        frame.append(0x80 | opcode)
+        length = len(payload)
+        if length < 126:
+            frame.append(length)
+        elif length < 65536:
+            frame.append(126)
+            frame.extend(struct.pack("!H", length))
+        else:
+            frame.append(127)
+            frame.extend(struct.pack("!Q", length))
+        frame.extend(payload)
+        try:
+            with self._ws_lock:
+                self.wfile.write(bytes(frame))
+                self.wfile.flush()
         except (OSError, ValueError):
             pass
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def term_write(self, sid):
-        sess = self.sessions.get(sid)
-        if not sess:
-            return self.send_error(404, "Sessione non trovata")
-        length = int(self.headers.get("Content-Length", 0))
-        data = self.rfile.read(length) if length else b""
-        if data:
-            try:
-                os.write(sess["fd"], data)
-            except OSError:
-                pass
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+    def ws_send_json(self, obj):
+        self.ws_send_frame(0x01, json.dumps(obj))
 
-    def term_resize(self, sid):
-        sess = self.sessions.get(sid)
-        if not sess:
-            return self.send_error(404, "Sessione non trovata")
+    def ws_handle(self):
+        if not self.ws_handshake():
+            return
+        sessions = FileServerHandler.sessions
         try:
-            cols = int(self.params.get("cols", ["80"])[0])
-            rows = int(self.params.get("rows", ["24"])[0])
-            fcntl.ioctl(sess["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        except (ValueError, OSError):
+            while True:
+                opcode, payload = self.ws_read_frame()
+                if opcode is None:
+                    break
+                if opcode == "close":
+                    break
+                try:
+                    msg = json.loads(payload.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                msg_type = msg.get("type")
+                if msg_type == "new":
+                    pid, master_fd = pty.fork()
+                    if pid == 0:
+                        os.chdir(self.storage_dir)
+                        env = os.environ.copy()
+                        env["TERM"] = "xterm-256color"
+                        os.execvpe("/bin/bash", ["/bin/bash", "--norc", "--noprofile"], env)
+                    sid = uuid.uuid4().hex
+                    sessions[sid] = {"pid": pid, "fd": master_fd, "dir": self.storage_dir}
+                    cols = msg.get("cols", 80)
+                    rows = msg.get("rows", 24)
+                    try:
+                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                    except (ValueError, OSError):
+                        pass
+                    self.ws_send_json({"type": "new", "sid": sid})
+                    reader = threading.Thread(target=FileServerHandler.ws_pty_reader, args=(self, sid), daemon=True)
+                    reader.start()
+                elif msg_type == "input":
+                    sid = msg.get("sid")
+                    data = msg.get("data", "")
+                    sess = sessions.get(sid)
+                    if sess:
+                        try:
+                            os.write(sess["fd"], data.encode("utf-8") if isinstance(data, str) else data)
+                        except OSError:
+                            pass
+                elif msg_type == "resize":
+                    sid = msg.get("sid")
+                    sess = sessions.get(sid)
+                    if sess:
+                        try:
+                            cols = int(msg.get("cols", 80))
+                            rows = int(msg.get("rows", 24))
+                            fcntl.ioctl(sess["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                        except (ValueError, OSError):
+                            pass
+                elif msg_type == "close":
+                    sid = msg.get("sid")
+                    sess = sessions.pop(sid, None)
+                    if sess:
+                        try:
+                            os.kill(sess["pid"], signal.SIGHUP)
+                        except OSError:
+                            pass
+                        try:
+                            os.close(sess["fd"])
+                        except OSError:
+                            pass
+        except (OSError, ValueError):
             pass
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        finally:
+            for sid, sess in list(sessions.items()):
+                try:
+                    os.kill(sess["pid"], signal.SIGHUP)
+                except OSError:
+                    pass
+                try:
+                    os.close(sess["fd"])
+                except OSError:
+                    pass
+            sessions.clear()
 
-    def term_close(self, sid):
-        sess = self.sessions.pop(sid, None)
-        if sess:
+    # --- WebSocket PTY reader thread (runs per session) ---
+    @staticmethod
+    def ws_pty_reader(ws_handler, sid):
+        import time as _time
+        sessions = FileServerHandler.sessions
+        while sid in sessions:
+            sess = sessions.get(sid)
+            if not sess:
+                break
+            fd = sess["fd"]
+            data = b""
             try:
-                os.kill(sess["pid"], signal.SIGHUP)
-            except OSError:
-                pass
-            try:
-                os.close(sess["fd"])
-            except OSError:
-                pass
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+                while True:
+                    r, _, _ = select.select([fd], [], [], 0.05)
+                    if not r:
+                        break
+                    chunk = os.read(fd, 8192)
+                    if not chunk:
+                        break
+                    data += chunk
+            except (OSError, ValueError):
+                break
+            if data:
+                try:
+                    ws_handler.ws_send_json({"type": "output", "sid": sid, "data": base64.b64encode(data).decode()})
+                except Exception:
+                    break
+            else:
+                _time.sleep(0.01)
+            if sess.get("exited"):
+                break
 
     # --- Gestione GET ---
     def do_GET(self):
@@ -286,25 +398,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
-        elif parsed.path == "/term/new":
+        elif parsed.path == "/term/ws":
             if not self.enable_terminal:
                 return self.send_error(404, "Terminale disabilitato")
-            return self.term_new()
-
-        elif parsed.path == "/term/read":
-            if not self.enable_terminal:
-                return self.send_error(404, "Terminale disabilitato")
-            return self.term_read(params.get("sid", [None])[0])
-
-        elif parsed.path == "/term/resize":
-            if not self.enable_terminal:
-                return self.send_error(404, "Terminale disabilitato")
-            return self.term_resize(params.get("sid", [None])[0])
-
-        elif parsed.path == "/term/close":
-            if not self.enable_terminal:
-                return self.send_error(404, "Terminale disabilitato")
-            return self.term_close(params.get("sid", [None])[0])
+            return self.ws_handle()
 
         else:
             self.send_error(404, "Not found")
@@ -342,11 +439,6 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path != "/upload":
-            if parsed.path == "/term/write":
-                if not self.enable_terminal:
-                    return self.send_error(404, "Terminale disabilitato")
-                params = parse_qs(parsed.query)
-                return self.term_write(params.get("sid", [None])[0])
             self.send_error(404, "Not found")
             return
 
@@ -468,7 +560,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     f"<td>{size}</td><td>{date}</td>"
                     f"<td><a href='/?path={html.escape(rel)}' class='nav-link' data-path='{html.escape(rel)}'>Apri</a> "
                     f"<a href='/download-dir?dir={html.escape(rel)}'>Scarica ZIP</a> "
-                    f"<a href='/delete?file={html.escape(rel)}' onclick='return confirm(\"Confermi cancellazione cartella {html.escape(rel)}?\");'>[Elimina]</a></td></tr>"
+                    f"<a href='#' onclick='deleteFile(\"{html.escape(rel)}\",\"cartella {html.escape(rel)}\");return false;'>[Elimina]</a></td></tr>"
                 )
             else:
                 is_text = False
@@ -487,7 +579,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     f"<tr><td>📄 {name_link}</td>"
                     f"<td>{size}</td><td>{date}</td>"
                     f"<td><a href='/download?file={html.escape(rel)}'>Scarica</a> "
-                    f"<a href='/delete?file={html.escape(rel)}' onclick='return confirm(\"Confermi cancellazione {html.escape(rel)}?\");'>[Elimina]</a></td></tr>"
+                    f"<a href='#' onclick='deleteFile(\"{html.escape(rel)}\",\"{html.escape(rel)}\");return false;'>[Elimina]</a></td></tr>"
                 )
 
         index_template = """<!DOCTYPE html>
@@ -904,6 +996,16 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     navigateTo(curPath);
                 }
 
+                function deleteFile(path, label) {
+                    if (!confirm("Confermi cancellazione " + label + "?")) return;
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("GET", "/delete?file=" + encodeURIComponent(path), true);
+                    xhr.onload = function () {
+                        refreshFileList();
+                    };
+                    xhr.send();
+                }
+
                 document.addEventListener("click", function (e) {
                     var link = e.target.closest ? e.target.closest(".nav-link") : null;
                     if (!link) return;
@@ -1076,8 +1178,59 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 var termContainer = document.getElementById("term-container");
                 var termAddBtn = document.getElementById("term-add");
                 var terms = [];
+                var pendingTerms = [];
                 var activeTerm = null;
                 var termCounter = 0;
+                var globalWs = null;
+                var wsLock = false;
+
+                function wsConnect(cb) {
+                    if (globalWs && globalWs.readyState === WebSocket.OPEN) { cb(globalWs); return; }
+                    if (wsLock) { var wait = setInterval(function() { if (!wsLock) { clearInterval(wait); cb(globalWs); } }, 20); return; }
+                    wsLock = true;
+                    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+                    var ws = new WebSocket(proto + "//" + location.host + "/term/ws");
+                    ws.binaryType = "arraybuffer";
+                    ws.onopen = function () {
+                        globalWs = ws;
+                        wsLock = false;
+                        ws.onmessage = function (evt) {
+                            var msg;
+                            try { msg = JSON.parse(evt.data); } catch (e) { return; }
+                            if (msg.type === "new") {
+                                for (var i = 0; i < pendingTerms.length; i++) {
+                                    if (!pendingTerms[i].sid) {
+                                        pendingTerms[i].sid = msg.sid;
+                                        pendingTerms.splice(i, 1);
+                                        termFocus();
+                                        break;
+                                    }
+                                }
+                            } else if (msg.type === "output") {
+                                var t = findTermBySid(msg.sid);
+                                if (t && t.term) {
+                                    var bin = atob(msg.data);
+                                    var bytes = new Uint8Array(bin.length);
+                                    for (var j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
+                                    t.term.write(bytes);
+                                }
+                            } else if (msg.type === "exit") {
+                                var t = findTermBySid(msg.sid);
+                                if (t) closeTerm(t);
+                            }
+                        };
+                        cb(ws);
+                    };
+                    ws.onclose = function () { globalWs = null; wsLock = false; };
+                    ws.onerror = function () { globalWs = null; wsLock = false; };
+                }
+
+                function findTermBySid(sid) {
+                    for (var i = 0; i < terms.length; i++) {
+                        if (terms[i].sid === sid) return terms[i];
+                    }
+                    return null;
+                }
 
                 termBtn.addEventListener("click", function () {
                     var wrap = document.getElementById("term-wrap");
@@ -1100,65 +1253,63 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 termAddBtn.addEventListener("click", openTerm);
 
                 function openTerm() {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", "/term/new", true);
-                    xhr.onload = function () {
-                        if (xhr.status === 200) {
-                            var resp = JSON.parse(xhr.responseText);
-                            termCounter++;
-                            var t = {
-                                id: termCounter,
-                                sid: resp.sid,
-                                term: null,
-                                fit: null,
-                                poll: null,
-                                div: null,
-                                tab: null,
-                                closeBtn: null
-                            };
-                            t.div = document.createElement("div");
-                            t.div.className = "term-view";
-                            termContainer.appendChild(t.div);
+                    wsConnect(function (ws) {
+                        termCounter++;
+                        var t = {
+                            id: termCounter,
+                            sid: null,
+                            term: null,
+                            fit: null,
+                            div: null,
+                            tab: null,
+                            closeBtn: null,
+                            lastCols: 0,
+                            lastRows: 0
+                        };
+                        t.div = document.createElement("div");
+                        t.div.className = "term-view";
+                        termContainer.appendChild(t.div);
 
-                            t.tab = document.createElement("div");
-                            t.tab.className = "term-tab";
-                            t.tab.textContent = "Terminale " + t.id + " ";
-                            t.closeBtn = document.createElement("span");
-                            t.closeBtn.className = "close";
-                            t.closeBtn.textContent = "✕";
-                            t.tab.appendChild(t.closeBtn);
-                            t.tab.addEventListener("click", function () { activateTerm(t); });
-                            t.closeBtn.addEventListener("click", function (e) {
-                                e.stopPropagation();
-                                closeTerm(t);
-                            });
-                            termTabs.appendChild(t.tab);
+                        t.tab = document.createElement("div");
+                        t.tab.className = "term-tab";
+                        t.tab.textContent = "Terminale " + t.id + " ";
+                        t.closeBtn = document.createElement("span");
+                        t.closeBtn.className = "close";
+                        t.closeBtn.textContent = "✕";
+                        t.tab.appendChild(t.closeBtn);
+                        t.tab.addEventListener("click", function () { activateTerm(t); });
+                        t.closeBtn.addEventListener("click", function (e) {
+                            e.stopPropagation();
+                            closeTerm(t);
+                        });
+                        termTabs.appendChild(t.tab);
 
-                            t.term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: "Menlo, Monaco, Consolas, monospace" });
-                            t.fit = new FitAddon.FitAddon();
-                            t.term.loadAddon(t.fit);
-                            t.term.open(t.div);
-                            t.observer = new ResizeObserver(function () {
-                                if (t.div.offsetHeight > 0) fitTerm(t);
-                            });
-                            t.observer.observe(t.div);
-                            t.term.onData(function (data) {
-                                var w = new XMLHttpRequest();
-                                w.open("POST", "/term/write?sid=" + encodeURIComponent(t.sid), true);
-                                w.setRequestHeader("Content-Type", "application/octet-stream");
-                                w.send(data);
-                            });
-                            t.poll = setInterval(function () { pollTerm(t); }, 100);
-                            registerOsc52(t.term);
-                            terms.push(t);
-                            activateTerm(t);
-                            setTimeout(function () { fitTerm(t); }, 50);
-                            termBar.classList.add("active");
-                            updateTermToggle();
-                            termFocus();
-                        }
-                    };
-                    xhr.send();
+                        t.term = new Terminal({ cursorBlink: true, fontSize: 14, fontFamily: "Menlo, Monaco, Consolas, monospace" });
+                        t.fit = new FitAddon.FitAddon();
+                        t.term.loadAddon(t.fit);
+                        t.term.open(t.div);
+                        t.observer = new ResizeObserver(function () {
+                            if (t.div.offsetHeight > 0) fitTerm(t);
+                        });
+                        t.observer.observe(t.div);
+                        t.term.onData(function (data) {
+                            if (globalWs && globalWs.readyState === WebSocket.OPEN && t.sid) {
+                                globalWs.send(JSON.stringify({type: "input", sid: t.sid, data: data}));
+                            }
+                        });
+                        registerOsc52(t.term);
+                        terms.push(t);
+                        pendingTerms.push(t);
+                        activateTerm(t);
+                        setTimeout(function () {
+                            t.fit.fit();
+                            t.lastCols = t.term.cols;
+                            t.lastRows = t.term.rows;
+                            ws.send(JSON.stringify({type: "new", cols: t.term.cols, rows: t.term.rows}));
+                        }, 50);
+                        termBar.classList.add("active");
+                        updateTermToggle();
+                    });
                 }
 
                 function activateTerm(t) {
@@ -1176,11 +1327,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 function closeTerm(t) {
                     var idx = terms.indexOf(t);
                     if (idx !== -1) terms.splice(idx, 1);
-                    if (t.poll) { clearInterval(t.poll); t.poll = null; }
-                    if (t.sid) {
-                        var xhr = new XMLHttpRequest();
-                        xhr.open("GET", "/term/close?sid=" + encodeURIComponent(t.sid), true);
-                        xhr.send();
+                    var pidx = pendingTerms.indexOf(t);
+                    if (pidx !== -1) pendingTerms.splice(pidx, 1);
+                    if (t.sid && globalWs && globalWs.readyState === WebSocket.OPEN) {
+                        globalWs.send(JSON.stringify({type: "close", sid: t.sid}));
                     }
                     if (t.term) { t.term.dispose(); t.term = null; }
                     if (t.observer) { t.observer.disconnect(); t.observer = null; }
@@ -1195,6 +1345,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
                 function closeAllTerms() {
                     while (terms.length) closeTerm(terms[terms.length - 1]);
+                    pendingTerms = [];
+                    if (globalWs) { globalWs.close(); globalWs = null; }
                     termBar.classList.remove("active");
                     updateTermToggle();
                 }
@@ -1247,27 +1399,15 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     }
                 }
 
-                function pollTerm(t) {
-                    if (!t.sid) return;
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", "/term/read?sid=" + encodeURIComponent(t.sid), true);
-                    xhr.onload = function () {
-                        if (xhr.status === 200 && xhr.response) {
-                            t.term.write(xhr.response);
-                        }
-                    };
-                    xhr.send();
-                }
-
                 function fitTerm(t) {
                     if (t && t.term && t.fit) {
                         t.fit.fit();
                         if (t.sid && (t.term.cols !== t.lastCols || t.term.rows !== t.lastRows)) {
                             t.lastCols = t.term.cols;
                             t.lastRows = t.term.rows;
-                            var xhr = new XMLHttpRequest();
-                            xhr.open("GET", "/term/resize?sid=" + encodeURIComponent(t.sid) + "&cols=" + t.term.cols + "&rows=" + t.term.rows, true);
-                            xhr.send();
+                            if (globalWs && globalWs.readyState === WebSocket.OPEN) {
+                                globalWs.send(JSON.stringify({type: "resize", sid: t.sid, cols: t.term.cols, rows: t.term.rows}));
+                            }
                         }
                     }
                 }
@@ -1278,9 +1418,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         e.stopPropagation();
                         var startY = e.clientY;
                         var startH = t.div.offsetHeight;
-                        var moving = false;
                         function onMove(ev) {
-                            moving = true;
                             var h = startH + (ev.clientY - startY);
                             if (h < 120) h = 120;
                             t.div.style.height = h + "px";
