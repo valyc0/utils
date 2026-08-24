@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serveo"
+version = "0.1.0"
+description = "Reverse tunnel SSH con porta gateway unica"
+requires-python = ">=3.10"
+dependencies = ["asyncssh>=2.14"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+serveo = "serveo.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["serveo*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
