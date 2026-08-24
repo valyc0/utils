@@ -5,29 +5,38 @@ macchina locale attraverso un server con sole 2 porte aperte.
 
 ## Installazione
 
+    python3 -m venv .venv
+    source .venv/bin/activate
     pip install .
 
 Dipendenza runtime: `asyncssh`.
 
+Nota: su Debian/Ubuntu recenti `pip` è bloccato a livello di sistema
+(PEP 668): serve il virtual environment come sopra, oppure `pipx install .`.
+
 ## Avvio sul server
 
-    python -m serveo --ssh-port 8086 --gateway-port 8087
+    source .venv/bin/activate   # se non già attivo
+    python -m serveo --ssh-port 8090 --gateway-port 8091
 
-Entrambe le porte sono configurabili; devono essere aperte sul firewall.
+Porta **8090** = server SSH (i client si connettono qui), porta
+**8091** = gateway pubblico di ingresso traffico. Devono essere aperte
+sul firewall.
 
 ## Uso dal client
 
 Apri il tunnel:
 
-    ssh -p 8086 -R 1522:localhost:1522 mioserver.com
+    ssh -p 8090 -R 1522:localhost:1522 mioserver.com
 
-Nella sessione vedrai la conferma. Chiunque raggiunga
-`mioserver.com:8087` viene instradato al tuo `localhost:1522`.
-Funziona con qualsiasi protocollo TCP (db, RDP, HTTP, WebSocket...).
+Nella sessione vedrai la conferma. Chiunque raggiunga la porta
+gateway `mioserver.com:8091` viene instradato al tuo `localhost:1522`
+(1522 nella `-R` è solo un'etichetta). Funziona con qualsiasi
+protocollo TCP (db, RDP, HTTP, WebSocket...).
 
 Con `-N` non apre shell ma mantiene il tunnel:
 
-    ssh -N -p 8086 -R 3000:localhost:3000 mioserver.com
+    ssh -N -p 8090 -R 3000:localhost:3000 mioserver.com
 
 ## Regole
 
@@ -46,5 +55,15 @@ avvio. I client vedranno questo fingerprint; aggiungi a
 
 ## Test
 
+    source .venv/bin/activate
     pip install -e '.[dev]'
     python -m pytest tests/ -v
+
+## Avvio senza attivare il venv
+
+    .venv/bin/python -m serveo --ssh-port 8090 --gateway-port 8091
+    # oppure
+    .venv/bin/serveo
+
+Per fermarlo: `Ctrl+C` se in primo piano, altrimenti trova il PID con
+`pgrep -f "python -m serveo"` e fai `kill <PID>`.

@@ -2,7 +2,7 @@ import asyncssh
 
 from serveo.config import Config
 from serveo.registry import TunnelRegistry
-from serveo.ssh_server import ServeoSSHServer, VirtualListener
+from serveo.ssh_server import InfoSession, ServeoSSHServer, VirtualListener
 
 
 def make_config(tmp_path):
@@ -47,9 +47,8 @@ def test_server_requested_registers_tunnel(tmp_path):
     assert reg.get() is None
 
 
-def test_session_requested_returns_factory(tmp_path):
+def test_session_requested_returns_session(tmp_path):
     server = ServeoSSHServer(TunnelRegistry(), make_config(tmp_path))
-    factory = server.session_requested()
-    assert callable(factory)
-    session = factory()
+    session = server.session_requested()
+    assert isinstance(session, InfoSession)
     assert hasattr(session, 'connection_made')

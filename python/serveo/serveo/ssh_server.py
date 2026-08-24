@@ -92,8 +92,8 @@ class ServeoSSHServer(asyncssh.SSHServer):
         self._last_forward = (listen_host, listen_port)
         return VirtualListener(listen_port)
 
-    def session_requested(self) -> 'InfoSessionFactory':
-        return lambda: InfoSession(self._banner())
+    def session_requested(self) -> 'InfoSession':
+        return InfoSession(self._banner())
 
     def _banner(self) -> str:
         if self._last_forward is not None:
