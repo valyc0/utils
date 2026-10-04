@@ -13,7 +13,7 @@ import struct
 import uuid
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from pathlib import Path
 import html
 import base64
@@ -53,12 +53,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     # --- Utilità ---
     def resolve_in_storage(self, name):
-        """Risolve `name` dentro storage_dir impedendo path traversal."""
+        """Risolve `name` (relativo a storage_dir, oppure assoluto). Si può navigare oltre storage_dir."""
         base = Path(self.storage_dir).resolve()
-        target = (base / name).resolve()
-        if base != target and base not in target.parents:
-            return None
-        return target
+        return (base / (name or "")).resolve()
 
     @staticmethod
     def sanitize_relative_path(filename):
@@ -181,14 +178,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     continue
                 msg_type = msg.get("type")
                 if msg_type == "new":
+                    cwd = self.resolve_in_storage(msg.get("cwd") or "")
+                    if not cwd.is_dir():
+                        cwd = Path(self.storage_dir).resolve()
                     pid, master_fd = pty.fork()
                     if pid == 0:
-                        os.chdir(self.storage_dir)
+                        os.chdir(cwd)
                         env = os.environ.copy()
                         env["TERM"] = "xterm-256color"
                         os.execvpe("/bin/bash", ["/bin/bash", "--norc", "--noprofile"], env)
                     sid = uuid.uuid4().hex
-                    sessions[sid] = {"pid": pid, "fd": master_fd, "dir": self.storage_dir}
+                    sessions[sid] = {"pid": pid, "fd": master_fd, "dir": str(cwd)}
                     cols = msg.get("cols", 80)
                     rows = msg.get("rows", 24)
                     try:
@@ -302,7 +302,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             if not filename:
                 return self.send_error(400, "Parametro 'file' mancante. Usa ?file=nomefile")
             file_path = self.resolve_in_storage(filename)
-            if file_path is None or not file_path.is_file():
+            if not file_path.is_file():
                 return self.send_error(404, "File non trovato")
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -318,21 +318,23 @@ class FileServerHandler(BaseHTTPRequestHandler):
             if not dirname:
                 return self.send_error(400, "Parametro 'dir' mancante. Usa ?dir=nomecartella")
             dir_path = self.resolve_in_storage(dirname)
-            if dir_path is None or not dir_path.is_dir():
+            if not dir_path.is_dir():
                 return self.send_error(404, "Directory non trovata")
 
-            # Crea lo ZIP in memoria mantenendo i percorsi relativi
-            base = Path(self.storage_dir).resolve()
+            # Crea lo ZIP in memoria mantenendo i percorsi relativi alla cartella scelta
+            zip_base = dir_path.parent
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for root, _, fnames in os.walk(dir_path):
                     for fname in fnames:
                         full = Path(root) / fname
-                        rel = full.relative_to(base)
-                        zf.write(full, rel.as_posix())
+                        try:
+                            zf.write(full, full.relative_to(zip_base).as_posix())
+                        except OSError:
+                            pass
             data = buf.getvalue()
 
-            zip_name = dirname.replace("\\", "/").rstrip("/").split("/")[-1]
+            zip_name = dir_path.name or "root"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{zip_name}.zip"')
@@ -345,8 +347,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
             if not filename:
                 return self.send_error(400, "Parametro 'file' mancante per cancellazione")
             target = self.resolve_in_storage(filename)
-            if target is None or not target.exists():
+            if not target.exists():
                 return self.send_error(404, "File o cartella non trovato")
+            if target == target.parent:
+                return self.send_error(403, "Impossibile cancellare la root del filesystem")
             try:
                 if target.is_dir():
                     shutil.rmtree(target)
@@ -363,14 +367,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
             if not filename:
                 return self.send_error(400, "Parametro 'file' mancante. Usa ?file=nomefile")
             target = self.resolve_in_storage(filename)
-            if target is None or not target.is_file():
+            if not target.is_file():
                 return self.send_error(404, "File non trovato")
             if target.stat().st_size > 512 * 1024:
                 return self.send_error(413, "File troppo grande per l'editor (max 512KB)")
-            data = target.read_bytes()
+            try:
+                data = target.read_bytes()
+            except OSError as e:
+                return self.send_error(403, f"Impossibile leggere il file: {e}")
             if b"\x00" in data:
                 return self.send_error(400, "File binario, non modificabile con l'editor")
-            body = json.dumps({"name": filename, "content": data.decode("utf-8", errors="replace")}).encode()
+            body = json.dumps({"name": str(target), "content": data.decode("utf-8", errors="replace")}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -426,8 +433,6 @@ class FileServerHandler(BaseHTTPRequestHandler):
             if not isinstance(filename, str) or not isinstance(content, str):
                 return self.send_error(400, "Campi 'path' e 'content' obbligatori (stringhe)")
             target = self.resolve_in_storage(filename)
-            if target is None:
-                return self.send_error(400, "Percorso non valido")
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
@@ -436,6 +441,35 @@ class FileServerHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+
+        if parsed.path == "/new":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self.send_error(400, "JSON non valido")
+            name = payload.get("path")
+            kind = payload.get("type", "file")
+            if not isinstance(name, str) or not name.strip() or kind not in ("file", "dir"):
+                return self.send_error(400, "Parametri non validi")
+            target = self.resolve_in_storage(name.strip())
+            if target.exists():
+                return self.send_error(409, "Esiste già un file o una cartella con questo nome")
+            try:
+                if kind == "dir":
+                    target.mkdir(parents=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.touch()
+            except OSError as e:
+                return self.send_error(500, f"Errore durante la creazione: {e}")
+            body = json.dumps({"path": str(target), "type": kind}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if parsed.path != "/upload":
@@ -456,7 +490,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             return self.send_error(400, "Malformed form data")
 
         saved = 0
-        upload_path = ""
+        upload_dir = self.resolve_in_storage("")
         while remainbytes > 0:
             line = self.rfile.readline()
             remainbytes -= len(line)
@@ -489,13 +523,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         break
                     value += preline
                     preline = line
-                upload_path = self.sanitize_relative_path(value.decode(errors="replace")) or ""
+                upload_dir = self.resolve_in_storage(value.decode(errors="replace"))
                 continue
 
             rel = self.sanitize_relative_path(filename) if filename else None
             if rel:
-                rel = f"{upload_path}/{rel}" if upload_path else rel
-                outpath = Path(self.storage_dir) / rel
+                outpath = upload_dir / rel
                 outpath.parent.mkdir(parents=True, exist_ok=True)
                 with open(outpath, 'wb') as out:
                     preline = self.rfile.readline()
@@ -525,61 +558,67 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
     # --- Pagina HTML principale ---
     def send_index_page(self, browse_path=""):
-        base = Path(self.storage_dir).resolve()
-        current = self.resolve_in_storage(browse_path) if browse_path else base
-        if current is None or not current.is_dir():
+        current = self.resolve_in_storage(browse_path)
+        if not current.is_dir():
             return self.send_error(404, "Cartella non trovata")
+        try:
+            entries = sorted(
+                current.iterdir(),
+                key=lambda p: (not p.is_dir(), p.name.lower())
+            )
+        except OSError as e:
+            return self.send_error(403, f"Cartella non leggibile: {e}")
 
-        entries = sorted(
-            current.iterdir(),
-            key=lambda p: (p.is_file(), p.name.lower())
-        )
+        esc = lambda s: html.escape(str(s), quote=True)
+        cur_str = str(current)
 
-        # Breadcrumb per la navigazione
-        crumbs = [('<a href="/" class="nav-link" data-path="">🏠 Root</a>', "")]
-        acc = ""
-        for part in browse_path.split("/"):
-            if not part:
-                continue
-            acc = f"{acc}/{part}" if acc else part
-            crumbs.append((f"<a href='/?path={html.escape(acc)}' class='nav-link' data-path='{html.escape(acc)}'>{html.escape(part)}</a>", acc))
-        crumb_html = " / ".join(c for c, _ in crumbs)
-        if browse_path:
-            crumb_html += f" <a href='/download-dir?dir={html.escape(browse_path)}'>⬇️ Scarica cartella ZIP</a>"
+        # Breadcrumb assoluto per la navigazione (anche sopra la cartella di partenza)
+        acc = Path(current.anchor)
+        crumbs = [f"<a href='#' class='nav-link' data-path='{esc(acc)}'>💽 /</a>"]
+        for part in current.parts[1:]:
+            acc = acc / part
+            crumbs.append(f"<a href='#' class='nav-link' data-path='{esc(acc)}'>{esc(part)}</a>")
+        crumb_html = " / ".join(crumbs)
+        if current.parent != current:
+            crumb_html = f"<a href='#' class='nav-link' data-path='{esc(current.parent)}' title='Cartella superiore'>⬆️ Su</a> &nbsp;|&nbsp; " + crumb_html
+        crumb_html +=f" &nbsp;<a href='/download-dir?dir={quote(cur_str)}'>⬇️ ZIP</a>"
 
         rows = ""
         for p in entries:
             name = p.name
-            rel = f"{browse_path}/{name}" if browse_path else name
-            st = p.stat()
-            size = self.format_size(st.st_size) if p.is_file() else "—"
+            rel = str(p)
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            is_dir = p.is_dir()
+            size = "—" if is_dir else self.format_size(st.st_size)
             date = self.format_date(st.st_mtime)
-            if p.is_dir():
+            if is_dir:
                 rows += (
-                    f"<tr><td>📁 <a href='/?path={html.escape(rel)}' class='nav-link' data-path='{html.escape(rel)}'>{html.escape(name)}/</a></td>"
+                    f"<tr><td>📁 <a href='#' class='nav-link' data-path='{esc(rel)}'>{esc(name)}/</a></td>"
                     f"<td>{size}</td><td>{date}</td>"
-                    f"<td><a href='/?path={html.escape(rel)}' class='nav-link' data-path='{html.escape(rel)}'>Apri</a> "
-                    f"<a href='/download-dir?dir={html.escape(rel)}'>Scarica ZIP</a> "
-                    f"<a href='#' onclick='deleteFile(\"{html.escape(rel)}\",\"cartella {html.escape(rel)}\");return false;'>[Elimina]</a></td></tr>"
+                    f"<td><a href='/download-dir?dir={quote(rel)}'>ZIP</a> "
+                    f"<a href='#' class='del-link' data-path='{esc(rel)}' data-label='cartella {esc(name)}'>[Elimina]</a></td></tr>"
                 )
             else:
                 is_text = False
                 if st.st_size <= 512 * 1024:
                     try:
-                        head = p.open("rb").read(4096)
-                        is_text = b"\x00" not in head
+                        with p.open("rb") as fh:
+                            is_text = b"\x00" not in fh.read(4096)
                     except OSError:
                         pass
                 name_link = (
-                    f"<a href='#' class='edit-link' data-file='{html.escape(rel)}' title='Apri nell\\'editor'>{html.escape(name)}</a>"
+                    f"<a href='#' class='edit-link' data-file='{esc(rel)}' title='Apri nell&#39;editor'>{esc(name)}</a>"
                     if is_text else
-                    f"<a href='/download?file={html.escape(rel)}'>{html.escape(name)}</a>"
+                    f"<a href='/download?file={quote(rel)}'>{esc(name)}</a>"
                 )
                 rows += (
                     f"<tr><td>📄 {name_link}</td>"
                     f"<td>{size}</td><td>{date}</td>"
-                    f"<td><a href='/download?file={html.escape(rel)}'>Scarica</a> "
-                    f"<a href='#' onclick='deleteFile(\"{html.escape(rel)}\",\"{html.escape(rel)}\");return false;'>[Elimina]</a></td></tr>"
+                    f"<td><a href='/download?file={quote(rel)}'>Scarica</a> "
+                    f"<a href='#' class='del-link' data-path='{esc(rel)}' data-label='{esc(name)}'>[Elimina]</a></td></tr>"
                 )
 
         index_template = """<!DOCTYPE html>
@@ -644,8 +683,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 #term-container { flex: 1; min-height: 0; padding: 0 8px 8px; }
                 .term-view { display: none; position: relative; height: 100%; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; box-sizing: border-box; }
                 .term-view.active { display: block; }
-                #new-file-btn, #refresh-btn { padding: 8px 14px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.95em; cursor: pointer; }
-                #new-file-btn:hover, #refresh-btn:hover { background: #6a1b9a; }
+                #new-form { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+                #new-name { flex: 1 1 100%; padding: 6px 8px; border: 1px solid #b0bec5; border-radius: 6px; font-size: 0.9em; }
+                #new-form button { padding: 7px 12px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.9em; cursor: pointer; }
+                #new-form button:hover { background: #6a1b9a; }
+                .ed-tab.dirty .ed-label::before { content: "● "; color: #ffb74d; }
+                #editor-bar .ed-btn { padding: 6px 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; background: #607d8b; color: #fff; }
+                #editor-bar .ed-btn:hover { background: #455a64; }
             </style>
         </head>
         <body>
@@ -672,10 +716,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             <input type="file" name="file" webkitdirectory multiple>
                             <input type="submit" value="Carica cartella">
                         </form>
-                        <div style="display:flex;gap:8px;margin:12px 0">
-                            <button id="new-file-btn">➕ Nuovo file</button>
-                            <button id="refresh-btn">🔄 Aggiorna</button>
-                        </div>
+                        <form id="new-form" autocomplete="off">
+                            <input type="text" id="new-name" placeholder="nome file (o sotto/cartella/file.txt)">
+                            <button type="submit" id="new-file-btn" title="Crea file nella cartella corrente e aprilo">📄 Nuovo file</button>
+                            <button type="button" id="new-dir-btn" title="Crea cartella">📁 Nuova cartella</button>
+                            <button type="button" id="refresh-btn">🔄</button>
+                        </form>
 
                         <h2>Contenuti disponibili</h2>
                         <table>
@@ -851,6 +897,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     if (cm) setTimeout(function () { cm.refresh(); }, 10);
                 }
 
+                function baseName(p) { return p.split("/").filter(Boolean).pop() || p; }
+
                 function findTab(name) {
                     for (var i = 0; i < openTabs.length; i++) {
                         if (openTabs[i].name === name) return openTabs[i];
@@ -858,135 +906,107 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     return null;
                 }
 
-                function saveActiveContent() {
-                    if (!activeTab) return;
-                    if (cm) activeTab.content = cm.getValue();
-                    else {
-                        var ta = document.getElementById("cm-fallback");
-                        if (ta) activeTab.content = ta.value;
-                    }
-                }
+                function isDirty(t) { return !t.doc.isClean(t.gen); }
 
                 function renderTabs() {
                     editorTabs.innerHTML = "";
-                    for (var i = 0; i < openTabs.length; i++) {
-                        (function (t) {
-                            var tab = document.createElement("div");
-                            tab.className = "ed-tab" + (t === activeTab ? " active" : "");
-                            tab.title = t.name;
-                            var label = document.createElement("span");
-                            label.textContent = t.name;
-                            tab.appendChild(label);
-                            var close = document.createElement("span");
-                            close.className = "ed-tab-close";
-                            close.textContent = "✕";
-                            close.addEventListener("click", function (e) { e.stopPropagation(); closeTab(t); });
-                            tab.appendChild(close);
-                            tab.addEventListener("click", function () { activateTab(t); });
-                            editorTabs.appendChild(tab);
-                        })(openTabs[i]);
-                    }
+                    openTabs.forEach(function (t) {
+                        var tab = document.createElement("div");
+                        tab.className = "ed-tab" + (t === activeTab ? " active" : "") + (isDirty(t) ? " dirty" : "");
+                        tab.title = t.name;
+                        var label = document.createElement("span");
+                        label.className = "ed-label";
+                        label.textContent = baseName(t.name);
+                        tab.appendChild(label);
+                        var close = document.createElement("span");
+                        close.className = "ed-tab-close";
+                        close.textContent = "✕";
+                        close.addEventListener("click", function (e) { e.stopPropagation(); closeTab(t); });
+                        tab.appendChild(close);
+                        tab.addEventListener("click", function () { activateTab(t); });
+                        tab.addEventListener("auxclick", function (e) { if (e.button === 1) closeTab(t); });
+                        editorTabs.appendChild(tab);
+                    });
+                }
+
+                function ensureCm() {
+                    if (cm) return;
+                    editorHost.innerHTML = "";
+                    cm = CodeMirror(editorHost, {
+                        lineNumbers: true,
+                        matchBrackets: true,
+                        indentUnit: 4,
+                        lineWrapping: true
+                    });
+                    cm.on("change", function () { if (activeTab) renderTabs(); });
                 }
 
                 function showPlaceholder() {
                     editorTitle.textContent = "Editor";
                     editorSetStatus("");
-                    editorHost.innerHTML = "<div id='editor-placeholder'>Clicca su un file per aprirlo nell'editor, o creane uno nuovo (➕ Nuovo file)</div>";
-                }
-
-                function createEditor(name, content) {
-                    editorTitle.textContent = "✏️ " + name;
-                    editorSetStatus("");
-                    if (typeof CodeMirror === "undefined") {
-                        editorHost.innerHTML = "<textarea style='width:100%;height:100%;font-family:monospace;font-size:14px;' id='cm-fallback'></textarea>";
-                        var ta = document.getElementById("cm-fallback");
-                        ta.value = content;
-                        cm = null;
-                    } else {
-                        if (cm) {
-                            var we = cm.getWrapperElement ? cm.getWrapperElement() : null;
-                            if (we && we.parentNode) we.parentNode.removeChild(we);
-                            cm = null;
-                        }
-                        editorHost.innerHTML = "";
-                        var mode = pickMode(name);
-                        if (!(window.CodeMirror && CodeMirror.modes && mode && CodeMirror.modes[mode])) mode = null;
-                        try {
-                            cm = CodeMirror(editorHost, {
-                                value: content,
-                                lineNumbers: true,
-                                mode: mode || "text/plain",
-                                matchBrackets: true,
-                                indentUnit: 4,
-                                lineWrapping: true
-                            });
-                            setTimeout(function () { cm.refresh(); cm.focus(); }, 10);
-                        } catch (err) {
-                            cm = null;
-                            editorHost.innerHTML = "<textarea style='width:100%;height:100%;font-family:monospace;font-size:14px;' id='cm-fallback'></textarea>";
-                            var ta = document.getElementById("cm-fallback");
-                            ta.value = content;
-                        }
-                    }
+                    if (cm) { var we = cm.getWrapperElement(); if (we.parentNode) we.parentNode.removeChild(we); cm = null; }
+                    editorHost.innerHTML = "<div id='editor-placeholder'>Clicca su un file per aprirlo nell'editor, o creane uno nuovo (📄 Nuovo file)</div>";
                 }
 
                 function activateTab(t) {
-                    if (t === activeTab) return;
-                    if (activeTab) saveActiveContent();
                     activeTab = t;
-                    createEditor(t.name, t.content);
+                    ensureCm();
+                    cm.swapDoc(t.doc);
+                    editorTitle.textContent = "✏️ " + t.name;
+                    editorSetStatus("");
                     renderTabs();
+                    setTimeout(function () { cm.refresh(); cm.focus(); }, 10);
                 }
 
                 function openEditor(name, content) {
                     var existing = findTab(name);
-                    if (existing) {
-                        activateTab(existing);
-                        return;
-                    }
-                    if (activeTab) saveActiveContent();
-                    activeTab = { name: name, content: content };
-                    openTabs.push(activeTab);
-                    createEditor(activeTab.name, activeTab.content);
-                    renderTabs();
+                    if (existing) { activateTab(existing); return; }
+                    var mode = pickMode(name);
+                    if (!(window.CodeMirror && CodeMirror.modes && mode && CodeMirror.modes[mode])) mode = null;
+                    var doc = CodeMirror.Doc(content, mode || "text/plain");
+                    var t = { name: name, doc: doc, gen: doc.changeGeneration() };
+                    openTabs.push(t);
+                    activateTab(t);
                 }
 
-                function closeTab(t) {
-                    var wasActive = (t === activeTab);
-                    if (wasActive) saveActiveContent();
+                function closeTab(t, force) {
+                    if (!force && isDirty(t) && !confirm("«" + baseName(t.name) + "» ha modifiche non salvate. Chiudere comunque?")) return;
                     var idx = openTabs.indexOf(t);
-                    if (idx !== -1) openTabs.splice(idx, 1);
-                    if (wasActive) {
-                        if (cm) {
-                            var we = cm.getWrapperElement ? cm.getWrapperElement() : null;
-                            if (we && we.parentNode) we.parentNode.removeChild(we);
-                            cm = null;
-                        }
-                        editorHost.innerHTML = "";
-                        activeTab = openTabs.length ? openTabs[Math.min(idx, openTabs.length - 1)] : null;
-                        if (activeTab) createEditor(activeTab.name, activeTab.content);
+                    if (idx === -1) return;
+                    openTabs.splice(idx, 1);
+                    if (t === activeTab) {
+                        activeTab = null;
+                        if (openTabs.length) activateTab(openTabs[Math.min(idx, openTabs.length - 1)]);
                         else showPlaceholder();
                     }
                     renderTabs();
                 }
 
-                function currentContent() {
-                    saveActiveContent();
-                    return activeTab ? activeTab.content : "";
+                function closeTabsUnder(path) {
+                    openTabs.slice().forEach(function (t) {
+                        if (t.name === path || t.name.indexOf(path + "/") === 0) closeTab(t, true);
+                    });
                 }
 
+                window.addEventListener("beforeunload", function (e) {
+                    if (openTabs.some(isDirty)) { e.preventDefault(); e.returnValue = ""; }
+                });
+
                 function navigateTo(path) {
-                    curPath = path || "";
-                    document.getElementById("drop-zone").setAttribute("data-path", curPath);
                     var xhr = new XMLHttpRequest();
-                    xhr.open("GET", "/?path=" + encodeURIComponent(curPath), true);
+                    xhr.open("GET", "/?path=" + encodeURIComponent(path || ""), true);
                     xhr.onload = function () {
                         if (xhr.status === 200) {
                             var doc = new DOMParser().parseFromString(xhr.responseText, "text/html");
-                            var tbody = doc.querySelector("table tbody");
-                            if (tbody) document.querySelector("table tbody").innerHTML = tbody.innerHTML;
-                            var crumbs = doc.querySelector("#crumbs");
-                            if (crumbs) document.querySelector("#crumbs").innerHTML = crumbs.innerHTML;
+                            var dz = doc.getElementById("drop-zone");
+                            curPath = dz.getAttribute("data-path") || "";
+                            document.getElementById("drop-zone").setAttribute("data-path", curPath);
+                            document.querySelectorAll("input[name=path]").forEach(function (i) { i.value = curPath; });
+                            document.querySelector("table tbody").innerHTML = doc.querySelector("table tbody").innerHTML;
+                            document.querySelector("#crumbs").innerHTML = doc.querySelector("#crumbs").innerHTML;
+                            document.title = "File Server - " + curPath;
+                        } else {
+                            alert("Impossibile aprire la cartella (HTTP " + xhr.status + ")");
                         }
                     };
                     xhr.send();
@@ -1001,9 +1021,40 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     var xhr = new XMLHttpRequest();
                     xhr.open("GET", "/delete?file=" + encodeURIComponent(path), true);
                     xhr.onload = function () {
+                        if (xhr.status >= 400) alert("Errore cancellazione (HTTP " + xhr.status + ")");
+                        else closeTabsUnder(path);
                         refreshFileList();
                     };
                     xhr.send();
+                }
+
+                document.addEventListener("click", function (e) {
+                    var link = e.target.closest ? e.target.closest(".del-link") : null;
+                    if (!link) return;
+                    e.preventDefault();
+                    deleteFile(link.getAttribute("data-path"), link.getAttribute("data-label"));
+                });
+
+                function createEntry(kind) {
+                    var input = document.getElementById("new-name");
+                    var name = input.value.trim();
+                    if (!name) { input.focus(); return; }
+                    var full = name.charAt(0) === "/" ? name : (curPath.replace(/\\/$/, "") + "/" + name);
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("POST", "/new", true);
+                    xhr.setRequestHeader("Content-Type", "application/json");
+                    xhr.onload = function () {
+                        if (xhr.status === 200) {
+                            var resp = JSON.parse(xhr.responseText);
+                            input.value = "";
+                            refreshFileList();
+                            if (kind === "file") openEditor(resp.path, "");
+                        } else {
+                            editorSetStatus("❌ " + (xhr.status === 409 ? "Esiste già" : "Errore creazione (HTTP " + xhr.status + ")"), "#ef5350");
+                            setTimeout(function () { editorSetStatus(""); }, 3000);
+                        }
+                    };
+                    xhr.send(JSON.stringify({ path: full, type: kind }));
                 }
 
                 document.addEventListener("click", function (e) {
@@ -1030,13 +1081,17 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
                 editorSave.addEventListener("click", function () {
                     if (!activeTab) return;
+                    var t = activeTab;
                     editorSetStatus("⏳ Salvataggio...");
-                    var payload = JSON.stringify({ path: activeTab.name, content: currentContent() });
+                    var gen = t.doc.changeGeneration();
+                    var payload = JSON.stringify({ path: t.name, content: t.doc.getValue() });
                     var xhr = new XMLHttpRequest();
                     xhr.open("POST", "/save", true);
                     xhr.setRequestHeader("Content-Type", "application/json");
                     xhr.onload = function () {
                         if (xhr.status === 200) {
+                            t.gen = gen;
+                            renderTabs();
                             editorSetStatus("✅ Salvato");
                             refreshFileList();
                             setTimeout(function () { editorSetStatus(""); }, 2000);
@@ -1076,13 +1131,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     xhr.send();
                 });
 
-                document.getElementById("new-file-btn").addEventListener("click", function () {
-                    var name = prompt("Nome del nuovo file (relativo alla cartella corrente):");
-                    if (!name) return;
-                    if (name.indexOf("/") === -1) {
-                        name = (curPath ? curPath + "/" : "") + name;
-                    }
-                    openEditor(name, "");
+                document.getElementById("new-form").addEventListener("submit", function (e) {
+                    e.preventDefault();
+                    createEntry("file");
+                });
+                document.getElementById("new-dir-btn").addEventListener("click", function () {
+                    createEntry("dir");
                 });
 
                 document.getElementById("refresh-btn").addEventListener("click", function () {
@@ -1235,20 +1289,27 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 termBtn.addEventListener("click", function () {
                     var wrap = document.getElementById("term-wrap");
                     var split = document.getElementById("hsplitter");
+                    // Nasconde/mostra il pannello senza uccidere le sessioni aperte
                     if (wrap.classList.contains("active")) {
-                        if (terms.length) closeAllTerms();
-                        wrap.classList.remove("active");
-                        split.classList.remove("active");
-                        termBtn.textContent = "🖥️ Apri terminale";
+                        hideTermPanel();
                     } else {
                         if (!wrap.style.height) wrap.style.height = "320px";
-                        if (!terms.length) openTerm();
                         wrap.classList.add("active");
                         split.classList.add("active");
-                        termBtn.textContent = "✖ Chiudi terminale";
+                        if (!terms.length) openTerm();
+                        updateTermToggle();
+                        if (activeTerm) fitTerm(activeTerm);
                         termFocus();
+                        refreshEditor();
                     }
                 });
+
+                function hideTermPanel() {
+                    document.getElementById("term-wrap").classList.remove("active");
+                    document.getElementById("hsplitter").classList.remove("active");
+                    updateTermToggle();
+                    refreshEditor();
+                }
 
                 termAddBtn.addEventListener("click", openTerm);
 
@@ -1305,7 +1366,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             t.fit.fit();
                             t.lastCols = t.term.cols;
                             t.lastRows = t.term.rows;
-                            ws.send(JSON.stringify({type: "new", cols: t.term.cols, rows: t.term.rows}));
+                            ws.send(JSON.stringify({type: "new", cols: t.term.cols, rows: t.term.rows, cwd: curPath}));
                         }, 50);
                         termBar.classList.add("active");
                         updateTermToggle();
@@ -1339,16 +1400,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     if (activeTerm === t) {
                         activeTerm = terms.length ? terms[terms.length - 1] : null;
                         if (activeTerm) activateTerm(activeTerm);
-                        else updateTermToggle();
+                        else hideTermPanel();
                     }
-                }
-
-                function closeAllTerms() {
-                    while (terms.length) closeTerm(terms[terms.length - 1]);
-                    pendingTerms = [];
-                    if (globalWs) { globalWs.close(); globalWs = null; }
-                    termBar.classList.remove("active");
-                    updateTermToggle();
                 }
 
                 function updateTermToggle() {
@@ -1449,7 +1502,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         html_content = index_template.replace(
             "{ROWS}",
             rows if rows else "<tr><td colspan='4'>Nessun contenuto presente</td></tr>"
-        ).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", html.escape(browse_path))
+        ).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", esc(cur_str))
         if FileServerHandler.enable_terminal:
             html_content = html_content.replace("{TERM_UI}", TERM_UI).replace("{TERM_SCRIPTS}", TERM_SCRIPTS).replace("{TERM_TOGGLE}", TERM_TOGGLE)
         else:
