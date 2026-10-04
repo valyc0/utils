@@ -286,7 +286,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/":
             browse_path = params.get("path", [""])[0]
-            return self.send_index_page(browse_path)
+            return self.send_index_page(browse_path, params.get("view", [""])[0], params.get("file", [""])[0])
 
         elif parsed.path == "/list":
             entries = sorted(p.name for p in Path(self.storage_dir).iterdir())
@@ -557,7 +557,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # --- Pagina HTML principale ---
-    def send_index_page(self, browse_path=""):
+    def send_index_page(self, browse_path="", view="", open_file=""):
         current = self.resolve_in_storage(browse_path)
         if not current.is_dir():
             return self.send_error(404, "Cartella non trovata")
@@ -683,6 +683,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 #term-container { flex: 1; min-height: 0; padding: 0 8px 8px; }
                 .term-view { display: none; position: relative; height: 100%; min-height: 120px; padding: 8px; background: #000; border-radius: 0 6px 6px 6px; border: 1px solid #455a64; box-sizing: border-box; }
                 .term-view.active { display: block; }
+                body.full-term #left-panel, body.full-term #vsplitter, body.full-term #editor-panel, body.full-term #hsplitter, body.full-term header,
+                body.full-editor #left-panel, body.full-editor #vsplitter, body.full-editor #term-wrap, body.full-editor #hsplitter, body.full-editor header { display: none !important; }
+                body.full-term #term-wrap { height: 100% !important; flex: 1; }
+                body.full-term #term-container { padding: 0; }
+                #header-btns { display: flex; gap: 8px; }
+                #term-newtab { padding: 8px 12px; border: none; border-radius: 6px; background: #1976d2; color: #fff; font-size: 0.95em; cursor: pointer; }
                 #new-form { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
                 #new-name { flex: 1 1 100%; padding: 6px 8px; border: 1px solid #b0bec5; border-radius: 6px; font-size: 0.9em; }
                 #new-form button { padding: 7px 12px; border: none; border-radius: 6px; background: #7b1fa2; color: #fff; font-size: 0.9em; cursor: pointer; }
@@ -692,7 +698,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 #editor-bar .ed-btn:hover { background: #455a64; }
             </style>
         </head>
-        <body>
+        <body class="{BODYCLASS}">
             <header>
                 <h1>📁 File Server</h1>
                 {TERM_TOGGLE}
@@ -738,6 +744,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         <div id="editor-bar">
                             <span id="editor-title">Editor</span>
                             <span id="editor-status"></span>
+                            <button id="editor-preview" class="ed-btn" style="display:none" title="Mostra/nascondi anteprima Markdown">👁 Anteprima</button>
+                            <button id="editor-newtab" class="ed-btn" title="Apri il file in un nuovo tab a schermo intero">↗ Nuovo tab</button>
                             <button id="editor-save">💾 Salva</button>
                         </div>
                         <div id="editor-host">
@@ -865,6 +873,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
             <script src="/static/codemirror/mode/htmlmixed.min.js"></script>
             <script src="/static/codemirror/mode/css.min.js"></script>
             <script src="/static/codemirror/mode/xml.min.js"></script>
+            <script src="/static/marked/marked.min.js"></script>
             <script>
                 var curPath = document.getElementById("drop-zone").getAttribute("data-path") || "";
                 var editorTabs = document.getElementById("editor-tabs");
@@ -938,13 +947,52 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         indentUnit: 4,
                         lineWrapping: true
                     });
-                    cm.on("change", function () { if (activeTab) renderTabs(); });
+                    cm.on("change", function () { if (activeTab) { renderTabs(); if (mdOn) renderMd(); } });
                 }
+
+                // --- Anteprima Markdown (iframe sandbox senza script: il contenuto non può eseguire codice) ---
+                var mdOn = false;
+                var mdBtn = document.getElementById("editor-preview");
+                var MD_CSS = "body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:16px 24px;line-height:1.55;color:#222}" +
+                    "pre{background:#f5f5f5;padding:10px;overflow:auto;border-radius:6px}code{background:#f5f5f5;padding:1px 4px;border-radius:3px}pre code{padding:0}" +
+                    "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 10px}blockquote{border-left:4px solid #ccc;margin-left:0;padding-left:14px;color:#555}img{max-width:100%}";
+
+                function isMd(name) { return /\\.(md|markdown)$/i.test(name || ""); }
+
+                function renderMd() {
+                    var fr = document.getElementById("md-preview");
+                    if (!fr || !activeTab) return;
+                    var body = (window.marked ? marked.parse(activeTab.doc.getValue()) : "<pre>marked non disponibile</pre>");
+                    fr.srcdoc = "<!DOCTYPE html><meta charset='utf-8'><style>" + MD_CSS + "</style>" + body;
+                }
+
+                function setMdPreview(on) {
+                    mdOn = on && !!activeTab && isMd(activeTab.name);
+                    var fr = document.getElementById("md-preview");
+                    if (mdOn) {
+                        if (!fr) {
+                            fr = document.createElement("iframe");
+                            fr.id = "md-preview";
+                            fr.setAttribute("sandbox", "");
+                            fr.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff";
+                            editorHost.appendChild(fr);
+                        }
+                        renderMd();
+                    } else if (fr) {
+                        fr.remove();
+                    }
+                    mdBtn.textContent = mdOn ? "✏️ Modifica" : "👁 Anteprima";
+                    if (!mdOn && cm) { cm.refresh(); cm.focus(); }
+                }
+
+                mdBtn.addEventListener("click", function () { setMdPreview(!mdOn); });
 
                 function showPlaceholder() {
                     editorTitle.textContent = "Editor";
                     editorSetStatus("");
                     if (cm) { var we = cm.getWrapperElement(); if (we.parentNode) we.parentNode.removeChild(we); cm = null; }
+                    mdOn = false;
+                    mdBtn.style.display = "none";
                     editorHost.innerHTML = "<div id='editor-placeholder'>Clicca su un file per aprirlo nell'editor, o creane uno nuovo (📄 Nuovo file)</div>";
                 }
 
@@ -952,6 +1000,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     activeTab = t;
                     ensureCm();
                     cm.swapDoc(t.doc);
+                    setMdPreview(false);
+                    mdBtn.style.display = isMd(t.name) ? "" : "none";
                     editorTitle.textContent = "✏️ " + t.name;
                     editorSetStatus("");
                     renderTabs();
@@ -1116,7 +1166,10 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     var link = e.target.closest ? e.target.closest(".edit-link") : null;
                     if (!link) return;
                     e.preventDefault();
-                    var file = link.getAttribute("data-file");
+                    openFile(link.getAttribute("data-file"));
+                });
+
+                function openFile(file) {
                     var xhr = new XMLHttpRequest();
                     xhr.open("GET", "/edit?file=" + encodeURIComponent(file), true);
                     xhr.onload = function () {
@@ -1129,7 +1182,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     };
                     xhr.onerror = function () { alert("Errore di rete"); };
                     xhr.send();
-                });
+                }
 
                 document.getElementById("new-form").addEventListener("submit", function (e) {
                     e.preventDefault();
@@ -1209,6 +1262,27 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 });
             </script>
             {TERM_SCRIPTS}
+            <script>
+                var FULL_VIEW = {FULLVIEW};
+                var FULL_FILE = {FULLFILE};
+                document.getElementById("editor-newtab").addEventListener("click", function () {
+                    if (!activeTab) return;
+                    if (isDirty(activeTab) && !confirm("Il file ha modifiche non salvate: il nuovo tab mostrerà la versione su disco. Continuare?")) return;
+                    window.open("/?view=editor&file=" + encodeURIComponent(activeTab.name), "_blank");
+                });
+                var ntBtn = document.getElementById("term-newtab");
+                if (ntBtn) ntBtn.addEventListener("click", function () {
+                    window.open("/?view=term&path=" + encodeURIComponent(curPath), "_blank");
+                });
+                if (FULL_VIEW === "term" && typeof openTerm === "function") {
+                    document.title = "Terminale - " + curPath;
+                    document.getElementById("term-wrap").classList.add("active");
+                    openTerm();
+                } else if (FULL_VIEW === "editor" && FULL_FILE) {
+                    document.title = "Editor - " + FULL_FILE;
+                    openFile(FULL_FILE);
+                }
+            </script>
         </body>
         </html>
         """
@@ -1221,7 +1295,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         </div>
         <div id="hsplitter" title="Ridimensiona terminale"></div>"""
 
-        TERM_TOGGLE = """<button id="term-toggle">🖥️ Apri terminale</button>"""
+        TERM_TOGGLE = """<div id="header-btns"><button id="term-newtab" title="Apri il terminale in un nuovo tab a schermo intero">↗ Terminale a tutto schermo</button><button id="term-toggle">🖥️ Apri terminale</button></div>"""
 
         TERM_SCRIPTS = """<script src="/static/xterm/xterm.js"></script>
         <script src="/static/xterm/addon-fit.js"></script>
@@ -1502,7 +1576,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         html_content = index_template.replace(
             "{ROWS}",
             rows if rows else "<tr><td colspan='4'>Nessun contenuto presente</td></tr>"
-        ).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", esc(cur_str))
+        ).replace("{BODYCLASS}", {"term": "full-term", "editor": "full-editor"}.get(view, "") if (view != "term" or FileServerHandler.enable_terminal) else "").replace("{FULLVIEW}", json.dumps(view)).replace("{FULLFILE}", json.dumps(open_file).replace("</", "<\\/")).replace("{CRUMBS}", crumb_html).replace("{CURPATH}", esc(cur_str))
         if FileServerHandler.enable_terminal:
             html_content = html_content.replace("{TERM_UI}", TERM_UI).replace("{TERM_SCRIPTS}", TERM_SCRIPTS).replace("{TERM_TOGGLE}", TERM_TOGGLE)
         else:
