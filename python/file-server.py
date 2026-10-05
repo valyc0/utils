@@ -251,6 +251,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
         if not self.ws_handshake():
             return
         sessions = FileServerHandler.sessions
+        attached = set()
         try:
             while True:
                 opcode, payload = self.ws_read_frame()
@@ -274,7 +275,9 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         env["TERM"] = "xterm-256color"
                         os.execvpe("/bin/bash", ["/bin/bash", "--norc", "--noprofile"], env)
                     sid = uuid.uuid4().hex
-                    sessions[sid] = {"pid": pid, "fd": master_fd, "dir": str(cwd)}
+                    sess = {"pid": pid, "fd": master_fd, "dir": str(cwd), "buf": bytearray(), "subs": {self}, "lock": threading.Lock()}
+                    sessions[sid] = sess
+                    attached.add(sid)
                     cols = msg.get("cols", 80)
                     rows = msg.get("rows", 24)
                     try:
@@ -282,8 +285,25 @@ class FileServerHandler(BaseHTTPRequestHandler):
                     except (ValueError, OSError):
                         pass
                     self.ws_send_json({"type": "new", "sid": sid})
-                    reader = threading.Thread(target=FileServerHandler.ws_pty_reader, args=(self, sid), daemon=True)
-                    reader.start()
+                    threading.Thread(target=FileServerHandler.ws_pty_reader, args=(sid, sess), daemon=True).start()
+                elif msg_type == "attach":
+                    # Collega questa connessione a una shell già esistente, riproducendo lo scrollback
+                    sid = msg.get("sid")
+                    sess = sessions.get(sid)
+                    if not sess:
+                        self.ws_send_json({"type": "exit", "sid": sid})
+                        continue
+                    try:
+                        fcntl.ioctl(sess["fd"], termios.TIOCSWINSZ,
+                                    struct.pack("HHHH", int(msg.get("rows", 24)), int(msg.get("cols", 80)), 0, 0))
+                    except (ValueError, OSError):
+                        pass
+                    with sess["lock"]:
+                        sess["subs"].add(self)
+                        attached.add(sid)
+                        self.ws_send_json({"type": "attached", "sid": sid})
+                        if sess["buf"]:
+                            self.ws_send_json({"type": "output", "sid": sid, "data": base64.b64encode(bytes(sess["buf"])).decode()})
                 elif msg_type == "input":
                     sid = msg.get("sid")
                     data = msg.get("data", "")
@@ -318,48 +338,53 @@ class FileServerHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             pass
         finally:
-            for sid, sess in list(sessions.items()):
-                try:
-                    os.kill(sess["pid"], signal.SIGHUP)
-                except OSError:
-                    pass
-                try:
-                    os.close(sess["fd"])
-                except OSError:
-                    pass
-            sessions.clear()
+            # Le shell sopravvivono alla chiusura della connessione (es. altro tab): ci si stacca soltanto
+            for sid in attached:
+                sess = sessions.get(sid)
+                if sess:
+                    with sess["lock"]:
+                        sess["subs"].discard(self)
 
-    # --- WebSocket PTY reader thread (runs per session) ---
+    # --- Thread lettore del PTY (uno per sessione, indipendente dalle connessioni) ---
     @staticmethod
-    def ws_pty_reader(ws_handler, sid):
-        import time as _time
+    def ws_pty_reader(sid, sess):
         sessions = FileServerHandler.sessions
-        while sid in sessions:
-            sess = sessions.get(sid)
-            if not sess:
-                break
-            fd = sess["fd"]
-            data = b""
+        fd = sess["fd"]
+        while sessions.get(sid) is sess:
             try:
-                while True:
-                    r, _, _ = select.select([fd], [], [], 0.05)
-                    if not r:
-                        break
-                    chunk = os.read(fd, 8192)
-                    if not chunk:
-                        break
-                    data += chunk
+                r, _, _ = select.select([fd], [], [], 0.2)
+                if not r:
+                    continue
+                data = os.read(fd, 8192)
             except (OSError, ValueError):
                 break
-            if data:
-                try:
-                    ws_handler.ws_send_json({"type": "output", "sid": sid, "data": base64.b64encode(data).decode()})
-                except Exception:
-                    break
-            else:
-                _time.sleep(0.01)
-            if sess.get("exited"):
+            if not data:
                 break
+            with sess["lock"]:
+                sess["buf"] += data
+                if len(sess["buf"]) > 262144:
+                    del sess["buf"][:-262144]
+                msg = {"type": "output", "sid": sid, "data": base64.b64encode(data).decode()}
+                for sub in list(sess["subs"]):
+                    try:
+                        sub.ws_send_json(msg)
+                    except Exception:
+                        sess["subs"].discard(sub)
+        if sessions.get(sid) is sess:
+            sessions.pop(sid, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.waitpid(sess["pid"], os.WNOHANG)
+            except OSError:
+                pass
+            for sub in list(sess["subs"]):
+                try:
+                    sub.ws_send_json({"type": "exit", "sid": sid})
+                except Exception:
+                    pass
 
     @staticmethod
     def safe_extract(arc, dest):
@@ -2125,12 +2150,18 @@ class FileServerHandler(BaseHTTPRequestHandler):
                 });
                 var ntBtn = document.getElementById("term-newtab");
                 if (ntBtn) ntBtn.addEventListener("click", function () {
-                    window.open("/?view=term&path=" + encodeURIComponent(curPath), "_blank");
+                    var sids = (typeof terms !== "undefined" ? terms : []).filter(function (t) { return t.sid; })
+                        .sort(function (a, b) { return (b === activeTerm) - (a === activeTerm); })
+                        .map(function (t) { return t.sid; });
+                    window.open("/?view=term&path=" + encodeURIComponent(curPath) + (sids.length ? "&sid=" + sids.join(",") : ""), "_blank");
                 });
                 if (FULL_VIEW === "term" && typeof openTerm === "function") {
                     document.title = "Terminale - " + curPath;
                     document.getElementById("term-wrap").classList.add("active");
-                    openTerm();
+                    var qs = new URLSearchParams(location.search).get("sid");
+                    var sidList = qs ? qs.split(",").filter(Boolean) : [];
+                    if (sidList.length) sidList.slice().reverse().forEach(function (sid) { openTerm(sid); });
+                    else openTerm();
                 } else if (FULL_VIEW === "editor" && FULL_FILE) {
                     document.title = "Editor - " + FULL_FILE;
                     openFile(FULL_FILE);
@@ -2240,7 +2271,8 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
                 termAddBtn.addEventListener("click", openTerm);
 
-                function openTerm() {
+                function openTerm(attachSid) {
+                    if (typeof attachSid !== "string") attachSid = null;
                     wsConnect(function (ws) {
                         termCounter++;
                         var t = {
@@ -2287,13 +2319,13 @@ class FileServerHandler(BaseHTTPRequestHandler):
                         });
                         registerOsc52(t.term);
                         terms.push(t);
-                        pendingTerms.push(t);
+                        if (attachSid) t.sid = attachSid; else pendingTerms.push(t);
                         activateTerm(t);
                         setTimeout(function () {
                             t.fit.fit();
                             t.lastCols = t.term.cols;
                             t.lastRows = t.term.rows;
-                            ws.send(JSON.stringify({type: "new", cols: t.term.cols, rows: t.term.rows, cwd: curPath}));
+                            ws.send(JSON.stringify({type: attachSid ? "attach" : "new", sid: attachSid, cols: t.term.cols, rows: t.term.rows, cwd: curPath}));
                         }, 50);
                         termBar.classList.add("active");
                         updateTermToggle();
