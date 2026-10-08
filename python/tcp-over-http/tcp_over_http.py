@@ -29,6 +29,11 @@ POLL_TIMEOUT = 25  # secondi di long-poll
 IDLE_TIMEOUT = 300  # sessioni senza attività vengono chiuse
 
 
+def _nodelay(sock):
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
 class _Session:
     def __init__(self, sock):
         self.sock = sock
@@ -64,6 +69,10 @@ class HttpTcpServer:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def setup(self):
+                super().setup()
+                _nodelay(self.request)
+
             def log_message(self, *a):
                 pass
 
@@ -94,7 +103,7 @@ class HttpTcpServer:
     def _dispatch(self, method, parts, body):
         op = parts[0]
         if op == "open" and method == "POST":
-            sock = socket.create_connection(self.target, timeout=10)
+            sock = _nodelay(socket.create_connection(self.target, timeout=10))
             sock.settimeout(None)
             sid = secrets.token_urlsafe(16)
             with self.lock:
@@ -176,7 +185,10 @@ class HttpTcpClient:
 
     def _conn(self):
         cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
-        return cls(self.host, self.port, timeout=POLL_TIMEOUT + 15)
+        conn = cls(self.host, self.port, timeout=POLL_TIMEOUT + 15)
+        conn.connect()
+        _nodelay(conn.sock)
+        return conn
 
     def _req(self, conn, method, path, body=None):
         headers = {"X-Token": self.token} if self.token else {}
@@ -185,6 +197,7 @@ class HttpTcpClient:
         return r.status, r.read()
 
     def _handle(self, client):
+        _nodelay(client)
         up, down = self._conn(), self._conn()
         try:
             status, sid = self._req(up, "POST", "/open", b"")
