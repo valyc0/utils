@@ -24,6 +24,7 @@ import signal
 import mimetypes
 import tarfile
 import tempfile
+import subprocess
 
 class FileServerHandler(BaseHTTPRequestHandler):
     storage_dir = "storage"
@@ -418,6 +419,51 @@ class FileServerHandler(BaseHTTPRequestHandler):
             raise ValueError("formato non supportato (zip, tar, tar.gz, tar.bz2, tar.xz)")
         return count
 
+    def run_git(self, cwd, *args):
+        r = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, timeout=15)
+        return r.returncode, r.stdout.decode("utf-8", errors="replace"), r.stderr.decode("utf-8", errors="replace")
+
+    def handle_git_status(self, params):
+        base = self.resolve_in_storage(params.get("path", [""])[0])
+        if not base.is_dir():
+            return self.send_error(400, "Parametri non validi")
+        try:
+            rc, top, err = self.run_git(base, "rev-parse", "--show-toplevel")
+            if rc != 0:
+                return self.send_json({"error": "Non è un repository git"})
+            top = top.strip()
+            rc, out, err = self.run_git(base, "status", "--porcelain", "-z", "-uall", "--", ".")
+        except (OSError, subprocess.SubprocessError) as e:
+            return self.send_json({"error": f"git non disponibile: {e}"})
+        if rc != 0:
+            return self.send_json({"error": err.strip() or "errore git"})
+        files, parts, i = [], out.split("\0"), 0
+        while i < len(parts):
+            ent = parts[i]
+            i += 1
+            if len(ent) < 4:
+                continue
+            code, rel = ent[:2], ent[3:]
+            if code[0] in "RC":
+                i += 1  # salta il percorso originale
+            files.append({"path": str(Path(top) / rel), "status": code})
+        self.send_json({"root": top, "files": files})
+
+    def handle_git_diff(self, params):
+        target = self.resolve_in_storage(params.get("file", [""])[0])
+        if not target.is_file():
+            return self.send_error(404, "File non trovato")
+        try:
+            rc, out, err = self.run_git(target.parent, "diff", "HEAD", "--no-color", "--", target.name)
+            if rc != 0:  # repo senza commit: confronta con l'indice
+                rc, out, err = self.run_git(target.parent, "diff", "--no-color", "--", target.name)
+            if not out.strip():
+                # file non tracciato: mostra tutto come aggiunto
+                _, out, _ = self.run_git(target.parent, "diff", "--no-color", "--no-index", "--", "/dev/null", target.name)
+        except (OSError, subprocess.SubprocessError) as e:
+            return self.send_json({"error": f"git non disponibile: {e}"})
+        self.send_json({"diff": out[:1024 * 1024]})
+
     def handle_search(self, params):
         base = self.resolve_in_storage(params.get("path", [""])[0])
         q = params.get("q", [""])[0].strip().lower()
@@ -546,6 +592,12 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/search":
             return self.handle_search(params)
+
+        elif parsed.path == "/git-status":
+            return self.handle_git_status(params)
+
+        elif parsed.path == "/git-diff":
+            return self.handle_git_diff(params)
 
         elif parsed.path == "/delete":
             filename = params.get("file", [None])[0]
@@ -1041,6 +1093,7 @@ class FileServerHandler(BaseHTTPRequestHandler):
                             <input type="text" id="new-name" placeholder="nome file (o sotto/cartella/file.txt)">
                             <button type="submit" id="new-file-btn" title="Crea file nella cartella corrente e aprilo">📄 Nuovo file</button>
                             <button type="button" id="new-dir-btn" title="Crea cartella">📁 Nuova cartella</button>
+                            <button type="button" id="git-btn" title="File modificati (git) in questa cartella">🔀 Git</button>
                             <button type="button" id="refresh-btn">🔄</button>
                         </form>
 
@@ -2007,6 +2060,55 @@ class FileServerHandler(BaseHTTPRequestHandler):
                                     window.open("/download?file=" + encodeURIComponent(r.path), "_blank");
                                 });
                             });
+                            searchBox.appendChild(it);
+                        });
+                    });
+                });
+
+                // --- File modificati (git) ---
+                function showGitDiff(path) {
+                    xhrJson("GET", "/git-diff?file=" + encodeURIComponent(path), undefined, function (st, o) {
+                        if (st !== 200 || !o || o.error) { flash("❌ " + ((o && o.error) || "Errore git (HTTP " + st + ")"), "#ef5350"); return; }
+                        var pre = document.createElement("pre");
+                        pre.className = "diff";
+                        if (!o.diff.trim()) pre.textContent = "Nessuna modifica.";
+                        o.diff.split(NL).forEach(function (l) {
+                            var span = document.createElement("span");
+                            var c = l.charAt(0);
+                            span.className = (c === "+" && l.indexOf("+++") !== 0) ? "dadd" : ((c === "-" && l.indexOf("---") !== 0) ? "ddel" : "dctx");
+                            span.textContent = l + NL;
+                            pre.appendChild(span);
+                        });
+                        openOverlay("Git diff: " + baseName(path), pre);
+                    });
+                }
+
+                document.getElementById("git-btn").addEventListener("click", function () {
+                    searchBox.style.display = "block";
+                    searchBox.textContent = "⏳ Lettura stato git...";
+                    xhrJson("GET", "/git-status?path=" + encodeURIComponent(curPath), undefined, function (st, o) {
+                        searchBox.innerHTML = "";
+                        var head = document.createElement("div");
+                        head.className = "sr-head";
+                        var x = document.createElement("a");
+                        x.href = "#";
+                        x.textContent = "[chiudi]";
+                        x.addEventListener("click", function (ev) { ev.preventDefault(); closeSearch(); });
+                        if (st !== 200 || !o || o.error) {
+                            head.textContent = "❌ " + ((o && o.error) || "Errore git (HTTP " + st + ")") + " ";
+                            head.appendChild(x);
+                            searchBox.appendChild(head);
+                            return;
+                        }
+                        head.textContent = o.files.length + " file modificati (git) ";
+                        head.appendChild(x);
+                        searchBox.appendChild(head);
+                        o.files.forEach(function (f) {
+                            var it = document.createElement("div");
+                            it.className = "sr-item";
+                            var rel = f.path.indexOf(curPath) === 0 ? f.path.slice(curPath.length).replace(/^[/]+/, "") : f.path;
+                            it.textContent = "[" + f.status.trim() + "] " + rel;
+                            it.addEventListener("click", function () { showGitDiff(f.path); });
                             searchBox.appendChild(it);
                         });
                     });
